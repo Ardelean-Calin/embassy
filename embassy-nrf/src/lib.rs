@@ -91,6 +91,7 @@ pub mod spim;
 #[cfg(not(any(feature = "_nrf5340", feature = "_nrf9160")))]
 pub mod temp;
 pub mod timer;
+pub mod timerv2;
 pub mod twim;
 pub mod uarte;
 #[cfg(any(
