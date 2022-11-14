@@ -55,6 +55,7 @@ pub struct Timer<MODE> {
 
 /// These functions may be used by any timer
 impl<MODE> Timer<MODE> {
+    // TODO: Timer0 cannot be used if softdevice is enabled. How do we specify that?
     pub fn new(instance: TimerInstance) -> Self {
         let base = unsafe {
             &*(match instance {
@@ -164,13 +165,15 @@ impl Timer<TimerType> {
     ///
     /// This will stop the timer if it isn't already stopped,
     /// because the timer may exhibit 'unpredictable behaviour' if it's frequency is changed while it's running.
-    pub fn set_frequency(&self, frequency: Frequency) {
+    pub fn with_frequency(self, frequency: Frequency) -> Timer<TimerType> {
         self.stop();
         self._base
             .prescaler
             // SAFETY: `frequency` is a variant of `Frequency`,
             // whose values are all in the range of 0-9 (the valid range of `prescaler`).
-            .write(|w| unsafe { w.prescaler().bits(frequency as u8) })
+            .write(|w| unsafe { w.prescaler().bits(frequency as u8) });
+
+        Timer { ..self }
     }
 }
 
