@@ -1,11 +1,9 @@
-use core::marker::PhantomData;
-
 use atomic_polyfill::{AtomicU8, Ordering};
 use embedded_hal_02::blocking::delay::DelayUs;
 use pac::adc::vals::{Adcaldif, Boost, Difsel, Exten, Pcsel};
 use pac::adccommon::vals::Presc;
 
-use super::{AdcPin, Instance};
+use super::{Adc, AdcPin, Instance, InternalChannel, Resolution, SampleTime};
 use crate::time::Hertz;
 use crate::{pac, Peripheral};
 
@@ -14,54 +12,10 @@ pub const VREF_DEFAULT_MV: u32 = 3300;
 /// VREF voltage used for factory calibration of VREFINTCAL register.
 pub const VREF_CALIB_MV: u32 = 3300;
 
-pub enum Resolution {
-    SixteenBit,
-    FourteenBit,
-    TwelveBit,
-    TenBit,
-    EightBit,
-}
-
-impl Default for Resolution {
-    fn default() -> Self {
-        Self::SixteenBit
-    }
-}
-
-impl Resolution {
-    fn res(&self) -> pac::adc::vals::Res {
-        match self {
-            Resolution::SixteenBit => pac::adc::vals::Res::SIXTEENBIT,
-            Resolution::FourteenBit => pac::adc::vals::Res::FOURTEENBITV,
-            Resolution::TwelveBit => pac::adc::vals::Res::TWELVEBITV,
-            Resolution::TenBit => pac::adc::vals::Res::TENBIT,
-            Resolution::EightBit => pac::adc::vals::Res::EIGHTBIT,
-        }
-    }
-
-    pub fn to_max_count(&self) -> u32 {
-        match self {
-            Resolution::SixteenBit => (1 << 16) - 1,
-            Resolution::FourteenBit => (1 << 14) - 1,
-            Resolution::TwelveBit => (1 << 12) - 1,
-            Resolution::TenBit => (1 << 10) - 1,
-            Resolution::EightBit => (1 << 8) - 1,
-        }
-    }
-}
-
-pub trait InternalChannel<T>: sealed::InternalChannel<T> {}
-
-mod sealed {
-    pub trait InternalChannel<T> {
-        fn channel(&self) -> u8;
-    }
-}
-
 // NOTE: Vrefint/Temperature/Vbat are only available on ADC3 on H7, this currently cannot be modeled with stm32-data, so these are available from the software on all ADCs
 pub struct VrefInt;
 impl<T: Instance> InternalChannel<T> for VrefInt {}
-impl<T: Instance> sealed::InternalChannel<T> for VrefInt {
+impl<T: Instance> super::sealed::InternalChannel<T> for VrefInt {
     fn channel(&self) -> u8 {
         19
     }
@@ -69,7 +23,7 @@ impl<T: Instance> sealed::InternalChannel<T> for VrefInt {
 
 pub struct Temperature;
 impl<T: Instance> InternalChannel<T> for Temperature {}
-impl<T: Instance> sealed::InternalChannel<T> for Temperature {
+impl<T: Instance> super::sealed::InternalChannel<T> for Temperature {
     fn channel(&self) -> u8 {
         18
     }
@@ -77,7 +31,7 @@ impl<T: Instance> sealed::InternalChannel<T> for Temperature {
 
 pub struct Vbat;
 impl<T: Instance> InternalChannel<T> for Vbat {}
-impl<T: Instance> sealed::InternalChannel<T> for Vbat {
+impl<T: Instance> super::sealed::InternalChannel<T> for Vbat {
     fn channel(&self) -> u8 {
         // TODO this should be 14 for H7a/b/35
         17
@@ -201,57 +155,6 @@ foreach_peripheral!(
     };
 );
 
-/// ADC sample time
-///
-/// The default setting is 2.5 ADC clock cycles.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub enum SampleTime {
-    /// 1.5 ADC clock cycles
-    Cycles1_5,
-
-    /// 2.5 ADC clock cycles
-    Cycles2_5,
-
-    /// 8.5 ADC clock cycles
-    Cycles8_5,
-
-    /// 16.5 ADC clock cycles
-    Cycles16_5,
-
-    /// 32.5 ADC clock cycles
-    Cycles32_5,
-
-    /// 64.5 ADC clock cycles
-    Cycles64_5,
-
-    /// 387.5 ADC clock cycles
-    Cycles387_5,
-
-    /// 810.5 ADC clock cycles
-    Cycles810_5,
-}
-
-impl SampleTime {
-    pub(crate) fn sample_time(&self) -> pac::adc::vals::Smp {
-        match self {
-            SampleTime::Cycles1_5 => pac::adc::vals::Smp::CYCLES1_5,
-            SampleTime::Cycles2_5 => pac::adc::vals::Smp::CYCLES2_5,
-            SampleTime::Cycles8_5 => pac::adc::vals::Smp::CYCLES8_5,
-            SampleTime::Cycles16_5 => pac::adc::vals::Smp::CYCLES16_5,
-            SampleTime::Cycles32_5 => pac::adc::vals::Smp::CYCLES32_5,
-            SampleTime::Cycles64_5 => pac::adc::vals::Smp::CYCLES64_5,
-            SampleTime::Cycles387_5 => pac::adc::vals::Smp::CYCLES387_5,
-            SampleTime::Cycles810_5 => pac::adc::vals::Smp::CYCLES810_5,
-        }
-    }
-}
-
-impl Default for SampleTime {
-    fn default() -> Self {
-        Self::Cycles1_5
-    }
-}
-
 // NOTE (unused): The prescaler enum closely copies the hardware capabilities,
 // but high prescaling doesn't make a lot of sense in the current implementation and is ommited.
 #[allow(unused)]
@@ -320,16 +223,9 @@ impl Prescaler {
     }
 }
 
-pub struct Adc<'d, T: Instance> {
-    sample_time: SampleTime,
-    vref_mv: u32,
-    resolution: Resolution,
-    phantom: PhantomData<&'d mut T>,
-}
-
-impl<'d, T: Instance + crate::rcc::RccPeripheral> Adc<'d, T> {
-    pub fn new(_peri: impl Peripheral<P = T> + 'd, delay: &mut impl DelayUs<u16>) -> Self {
-        embassy_hal_common::into_ref!(_peri);
+impl<'d, T: Instance> Adc<'d, T> {
+    pub fn new(adc: impl Peripheral<P = T> + 'd, delay: &mut impl DelayUs<u16>) -> Self {
+        embassy_hal_common::into_ref!(adc);
         T::enable();
         T::reset();
 
@@ -359,10 +255,8 @@ impl<'d, T: Instance + crate::rcc::RccPeripheral> Adc<'d, T> {
         }
 
         let mut s = Self {
+            adc,
             sample_time: Default::default(),
-            vref_mv: VREF_DEFAULT_MV,
-            resolution: Resolution::default(),
-            phantom: PhantomData,
         };
         s.power_up(delay);
         s.configure_differential_inputs();
@@ -464,19 +358,9 @@ impl<'d, T: Instance + crate::rcc::RccPeripheral> Adc<'d, T> {
     }
 
     pub fn set_resolution(&mut self, resolution: Resolution) {
-        self.resolution = resolution;
-    }
-
-    /// Set VREF value in millivolts. This value is used for [to_millivolts()] sample conversion.
-    ///
-    /// Use this if you have a known precise VREF (VDDA) pin reference voltage.
-    pub fn set_vref_mv(&mut self, vref_mv: u32) {
-        self.vref_mv = vref_mv;
-    }
-
-    /// Convert a measurement to millivolts
-    pub fn to_millivolts(&self, sample: u16) -> u16 {
-        ((u32::from(sample) * self.vref_mv) / self.resolution.to_max_count()) as u16
+        unsafe {
+            T::regs().cfgr().modify(|reg| reg.set_res(resolution.into()));
+        }
     }
 
     /// Perform a single conversion.
@@ -517,9 +401,6 @@ impl<'d, T: Instance + crate::rcc::RccPeripheral> Adc<'d, T> {
     }
 
     unsafe fn read_channel(&mut self, channel: u8) -> u16 {
-        // Configure ADC
-        T::regs().cfgr().modify(|reg| reg.set_res(self.resolution.res()));
-
         // Configure channel
         Self::set_channel_sample_time(channel, self.sample_time);
 
@@ -536,14 +417,11 @@ impl<'d, T: Instance + crate::rcc::RccPeripheral> Adc<'d, T> {
     }
 
     unsafe fn set_channel_sample_time(ch: u8, sample_time: SampleTime) {
+        let sample_time = sample_time.into();
         if ch <= 9 {
-            T::regs()
-                .smpr(0)
-                .modify(|reg| reg.set_smp(ch as _, sample_time.sample_time()));
+            T::regs().smpr(0).modify(|reg| reg.set_smp(ch as _, sample_time));
         } else {
-            T::regs()
-                .smpr(1)
-                .modify(|reg| reg.set_smp((ch - 10) as _, sample_time.sample_time()));
+            T::regs().smpr(1).modify(|reg| reg.set_smp((ch - 10) as _, sample_time));
         }
     }
 }
