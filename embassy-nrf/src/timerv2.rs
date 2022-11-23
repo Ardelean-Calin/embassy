@@ -2,7 +2,7 @@ use core::marker::PhantomData;
 
 use nrf52832_pac as pac;
 
-use crate::ppi::{Event, Task};
+use crate::ppi::Task;
 
 /// Note:
 /// PRESCALER on page 239 and the BITMODE on page 239 must only be updated when the timer
