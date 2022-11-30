@@ -1,6 +1,8 @@
+use core::marker::PhantomData;
+
 use nrf52832_pac as pac;
 
-use crate::ppi::{Event, Task};
+use crate::ppi::Task;
 
 /// Note:
 /// PRESCALER on page 239 and the BITMODE on page 239 must only be updated when the timer
@@ -29,42 +31,59 @@ pub enum Bitmode {
     B32 = 3,
 }
 
+pub enum TimerInstance {
+    TIMER0,
+    TIMER1,
+    TIMER2,
+    // TIMER3, // TODO: Only the 4 CC register timers for now.
+    // TIMER4,
+}
+
 pub enum Prescaler {}
 
 pub struct NotConfigured;
 pub struct CounterType;
 pub struct TimerType;
 
-pub fn get_timer() -> Timer<NotConfigured> {
-    let timer = Timer {
-        _mode: NotConfigured,
-        bitmode: Bitmode::B24, // The default bitmode
-    };
-    timer.stop(); // Initialize the counter at 0.
-    timer.clear(); // Appearently necessary for proper functioning!
-
-    // Not really necessary...
-    for n in 0..4 {
-        let cc = timer.cc(n);
-        // Initialize all the shorts as disabled.
-        cc.unshort_compare_clear();
-        cc.unshort_compare_stop();
-        // Initialize the CC registers as 0.
-        cc.write(0);
-    }
-    timer
-}
-
 pub struct Timer<MODE> {
     // periph: pac::TIMER0,
-    _mode: MODE,
+    _instance: TimerInstance,
+    _base: &'static pac::timer0::RegisterBlock,
+    _mode: PhantomData<MODE>,
     bitmode: Bitmode,
 }
 
 /// These functions may be used by any timer
 impl<MODE> Timer<MODE> {
-    fn regs(&self) -> &'static pac::timer0::RegisterBlock {
-        unsafe { &*(pac::TIMER0::ptr() as *const pac::timer0::RegisterBlock) }
+    // TODO: Timer0 cannot be used if softdevice is enabled. How do we specify that?
+    pub fn new(instance: TimerInstance) -> Self {
+        let base = unsafe {
+            &*(match instance {
+                TimerInstance::TIMER0 => pac::TIMER0::ptr(),
+                TimerInstance::TIMER1 => pac::TIMER1::ptr(),
+                TimerInstance::TIMER2 => pac::TIMER2::ptr(),
+            } as *const pac::timer0::RegisterBlock)
+        };
+
+        let timer = Timer {
+            _base: base,
+            _instance: instance,
+            _mode: PhantomData,    // basically a placeholder for MODE.
+            bitmode: Bitmode::B24, // The default bitmode
+        };
+        timer.stop(); // Initialize the counter at 0.
+        timer.clear(); // Appearently necessary for proper functioning!
+
+        // Not really necessary...
+        for n in 0..4 {
+            let cc = timer.cc(n);
+            // Initialize all the shorts as disabled.
+            // cc.unshort_compare_clear();
+            // cc.unshort_compare_stop();
+            // Initialize the CC registers as 0.
+            cc.write(0);
+        }
+        timer
     }
 
     /// Adjusts the bitmode of the current timer.
@@ -77,7 +96,7 @@ impl<MODE> Timer<MODE> {
     fn set_bitmode(&self, bitmode: &Bitmode) {
         self.stop();
         // Set bit width
-        self.regs().bitmode.write(|w| match bitmode {
+        self._base.bitmode.write(|w| match bitmode {
             Bitmode::B8 => w.bitmode()._08bit(),
             Bitmode::B16 => w.bitmode()._16bit(),
             Bitmode::B24 => w.bitmode()._24bit(),
@@ -87,38 +106,47 @@ impl<MODE> Timer<MODE> {
 
     /// Starts the timer.
     pub fn start(&self) {
-        self.regs().tasks_start.write(|w| unsafe { w.bits(1) })
+        self._base.tasks_start.write(|w| unsafe { w.bits(1) });
     }
 
     /// Stops the timer.
     pub fn stop(&self) {
-        self.regs().tasks_stop.write(|w| unsafe { w.bits(1) })
+        self._base.tasks_stop.write(|w| unsafe { w.bits(1) });
+    }
+
+    /// Stops the timer.
+    pub fn shutdown(&self) {
+        self._base.tasks_shutdown.write(|w| unsafe { w.bits(1) });
     }
 
     /// Reset the timer's counter to 0.
     pub fn clear(&self) {
-        self.regs().tasks_clear.write(|w| unsafe { w.bits(1) })
+        self._base.tasks_clear.write(|w| unsafe { w.bits(1) });
     }
 
     /// Returns the START task, for use with PPI.
     ///
     /// When triggered, this task starts the timer.
     pub fn task_start(&self) -> Task {
-        Task::from_reg(&self.regs().tasks_start)
+        Task::from_reg(&self._base.tasks_start)
+    }
+
+    pub fn task_shutdown(&self) -> Task {
+        Task::from_reg(&self._base.tasks_shutdown)
     }
 
     /// Returns the STOP task, for use with PPI.
     ///
     /// When triggered, this task stops the timer.
     pub fn task_stop(&self) -> Task {
-        Task::from_reg(&self.regs().tasks_shutdown)
+        Task::from_reg(&self._base.tasks_stop)
     }
 
     /// Returns the CLEAR task, for use with PPI.
     ///
     /// When triggered, this task resets the timer's counter to 0.
     pub fn task_clear(&self) -> Task {
-        Task::from_reg(&self.regs().tasks_clear)
+        Task::from_reg(&self._base.tasks_clear)
     }
 
     /// Returns this timer's `n`th CC register.
@@ -129,7 +157,7 @@ impl<MODE> Timer<MODE> {
         if n >= 4 {
             panic!("Cannot get CC register {} of timer with {} CC registers.", n, 4);
         }
-        Cc { n }
+        Cc { n, _base: self._base }
     }
 
     // pub(crate) fn new() -> Self {
@@ -146,13 +174,15 @@ impl Timer<TimerType> {
     ///
     /// This will stop the timer if it isn't already stopped,
     /// because the timer may exhibit 'unpredictable behaviour' if it's frequency is changed while it's running.
-    pub fn set_frequency(&self, frequency: Frequency) {
+    pub fn with_frequency(self, frequency: Frequency) -> Timer<TimerType> {
         self.stop();
-        self.regs()
+        self._base
             .prescaler
             // SAFETY: `frequency` is a variant of `Frequency`,
             // whose values are all in the range of 0-9 (the valid range of `prescaler`).
-            .write(|w| unsafe { w.prescaler().bits(frequency as u8) })
+            .write(|w| unsafe { w.prescaler().bits(frequency as u8) });
+
+        Timer { ..self }
     }
 }
 
@@ -162,26 +192,30 @@ impl Timer<CounterType> {
     ///
     /// When triggered, this task increments the counter.
     pub fn task_count(&self) -> Task {
-        Task::from_reg(&self.regs().tasks_count)
+        Task::from_reg(&self._base.tasks_count)
     }
 }
 
 /// These functions may only be used on non-configured timers.
 impl Timer<NotConfigured> {
     pub fn into_counter(self) -> Timer<CounterType> {
-        self.regs().mode.write(|w| w.mode().low_power_counter());
+        self._base.mode.write(|w| w.mode().low_power_counter());
 
         Timer {
-            _mode: CounterType,
+            _mode: PhantomData,
+            _instance: self._instance,
+            _base: self._base,
             bitmode: self.bitmode,
         }
     }
 
     pub fn into_timer(self) -> Timer<TimerType> {
-        self.regs().mode.write(|w| w.mode().timer());
+        self._base.mode.write(|w| w.mode().timer());
 
         Timer {
-            _mode: TimerType,
+            _mode: PhantomData,
+            _instance: self._instance,
+            _base: self._base,
             bitmode: self.bitmode,
         }
     }
@@ -195,17 +229,15 @@ impl Timer<NotConfigured> {
 /// The timer will fire the register's COMPARE event when its counter reaches the value stored in the register.
 /// When the register's CAPTURE task is triggered, the timer will store the current value of its counter in the register
 pub struct Cc {
+    // _baseReg: pac::generic::Reg<CC_SPEC>,
+    _base: &'static pac::timer0::RegisterBlock,
     n: usize,
 }
 
 impl Cc {
-    fn regs(&self) -> &'static pac::timer0::RegisterBlock {
-        unsafe { &*pac::TIMER0::ptr() }
-    }
-
     /// Get the current value stored in the register.
     pub fn read(&self) -> u32 {
-        self.regs().cc[self.n].read().cc().bits()
+        self._base.cc[self.n].read().cc().bits()
     }
 
     /// Set the value stored in the register.
@@ -213,62 +245,33 @@ impl Cc {
     /// `event_compare` will fire when the timer's counter reaches this value.
     pub fn write(&self, value: u32) {
         // SAFETY: there are no invalid values for the CC register.
-        self.regs().cc[self.n].write(|w| unsafe { w.cc().bits(value) })
+        self._base.cc[self.n].write(|w| unsafe { w.cc().bits(value) })
     }
 
     /// Capture the current value of the timer's counter in this register, and return it.
     pub fn capture(&self) -> u32 {
-        self.regs().tasks_capture[self.n].write(|w| unsafe { w.bits(1) });
+        self._base.tasks_capture[self.n].write(|w| unsafe { w.bits(1) });
         self.read()
-    }
-
-    /// Returns this CC register's CAPTURE task, for use with PPI.
-    ///
-    /// When triggered, this task will capture the current value of the timer's counter in this register.
-    pub fn task_capture(&self) -> Task {
-        Task::from_reg(&self.regs().tasks_capture)
-    }
-
-    /// Returns this CC register's COMPARE event, for use with PPI.
-    ///
-    /// This event will fire when the timer's counter reaches the value in this CC register.
-    pub fn event_compare(&self) -> Event {
-        Event::from_reg(&self.regs().events_compare[self.n])
-    }
-
-    /// Enable the shortcut between this CC register's COMPARE event and the timer's CLEAR task.
-    ///
-    /// This means that when the COMPARE event is fired, the CLEAR task will be triggered.
-    ///
-    /// So, when the timer's counter reaches the value stored in this register, the timer's counter will be reset to 0.
-    pub fn short_compare_clear(&self) {
-        self.regs()
-            .shorts
-            .modify(|r, w| unsafe { w.bits(r.bits() | (1 << self.n)) })
     }
 
     /// Disable the shortcut between this CC register's COMPARE event and the timer's CLEAR task.
     pub fn unshort_compare_clear(&self) {
-        self.regs()
+        self._base
             .shorts
             .modify(|r, w| unsafe { w.bits(r.bits() & !(1 << self.n)) })
     }
-
-    /// Enable the shortcut between this CC register's COMPARE event and the timer's STOP task.
-    ///
-    /// This means that when the COMPARE event is fired, the STOP task will be triggered.
-    ///
-    /// So, when the timer's counter reaches the value stored in this register, the timer will stop counting up.
-    pub fn short_compare_stop(&self) {
-        self.regs()
-            .shorts
-            .modify(|r, w| unsafe { w.bits(r.bits() | (1 << (8 + self.n))) })
-    }
-
     /// Disable the shortcut between this CC register's COMPARE event and the timer's STOP task.
     pub fn unshort_compare_stop(&self) {
-        self.regs()
+        self._base
             .shorts
             .modify(|r, w| unsafe { w.bits(r.bits() & !(1 << (8 + self.n))) })
+    }
+}
+
+impl Drop for Cc {
+    fn drop(&mut self) {
+        self._base
+            .intenclr
+            .modify(|r, w| unsafe { w.bits(r.bits() | (1 << (16 + self.n))) });
     }
 }
