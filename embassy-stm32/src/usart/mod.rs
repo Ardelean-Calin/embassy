@@ -2,9 +2,9 @@
 
 use core::future::poll_fn;
 use core::marker::PhantomData;
+use core::sync::atomic::{compiler_fence, Ordering};
 use core::task::Poll;
 
-use atomic_polyfill::{compiler_fence, Ordering};
 use embassy_cortex_m::interrupt::InterruptExt;
 use embassy_futures::select::{select, Either};
 use embassy_hal_common::drop::OnDrop;
@@ -405,7 +405,7 @@ impl<'d, T: BasicInstance, RxDma> UartRx<'d, T, RxDma> {
         let r = T::regs();
 
         // make sure USART state is restored to neutral state when this future is dropped
-        let _drop = OnDrop::new(move || {
+        let on_drop = OnDrop::new(move || {
             // defmt::trace!("Clear all USART interrupts and DMA Read Request");
             // clear all interrupts and DMA Rx Request
             // SAFETY: only clears Rx related flags
@@ -563,7 +563,7 @@ impl<'d, T: BasicInstance, RxDma> UartRx<'d, T, RxDma> {
         // wait for the first of DMA request or idle line detected to completes
         // select consumes its arguments
         // when transfer is dropped, it will stop the DMA request
-        match select(transfer, idle).await {
+        let r = match select(transfer, idle).await {
             // DMA transfer completed first
             Either::First(()) => Ok(ReadCompletionEvent::DmaCompleted),
 
@@ -572,7 +572,11 @@ impl<'d, T: BasicInstance, RxDma> UartRx<'d, T, RxDma> {
 
             // error occurred
             Either::Second(Err(e)) => Err(e),
-        }
+        };
+
+        drop(on_drop);
+
+        r
     }
 
     async fn inner_read(&mut self, buffer: &mut [u8], enable_idle_line_detection: bool) -> Result<usize, Error>
@@ -641,6 +645,31 @@ impl<'d, T: BasicInstance, TxDma, RxDma> Uart<'d, T, TxDma, RxDma> {
             T::regs().cr3().write(|w| {
                 w.set_rtse(true);
                 w.set_ctse(true);
+            });
+        }
+        Self::new_inner(peri, rx, tx, irq, tx_dma, rx_dma, config)
+    }
+
+    #[cfg(not(usart_v1))]
+    pub fn new_with_de(
+        peri: impl Peripheral<P = T> + 'd,
+        rx: impl Peripheral<P = impl RxPin<T>> + 'd,
+        tx: impl Peripheral<P = impl TxPin<T>> + 'd,
+        irq: impl Peripheral<P = T::Interrupt> + 'd,
+        de: impl Peripheral<P = impl DePin<T>> + 'd,
+        tx_dma: impl Peripheral<P = TxDma> + 'd,
+        rx_dma: impl Peripheral<P = RxDma> + 'd,
+        config: Config,
+    ) -> Self {
+        into_ref!(de);
+
+        T::enable();
+        T::reset();
+
+        unsafe {
+            de.set_as_af(de.af_num(), AFType::OutputPushPull);
+            T::regs().cr3().write(|w| {
+                w.set_dem(true);
             });
         }
         Self::new_inner(peri, rx, tx, irq, tx_dma, rx_dma, config)
@@ -741,7 +770,14 @@ fn configure(r: Regs, config: &Config, pclk_freq: Hertz, multiplier: u32, enable
 
     unsafe {
         r.brr().write_value(regs::Brr(div));
-        r.cr2().write(|_w| {});
+        r.cr2().write(|w| {
+            w.set_stop(match config.stop_bits {
+                StopBits::STOP0P5 => vals::Stop::STOP0P5,
+                StopBits::STOP1 => vals::Stop::STOP1,
+                StopBits::STOP1P5 => vals::Stop::STOP1P5,
+                StopBits::STOP2 => vals::Stop::STOP2,
+            });
+        });
         r.cr1().write(|w| {
             // enable uart
             w.set_ue(true);
@@ -881,6 +917,58 @@ mod eh1 {
 
         fn flush(&mut self) -> nb::Result<(), Self::Error> {
             self.blocking_flush().map_err(nb::Error::Other)
+        }
+    }
+}
+
+#[cfg(all(feature = "unstable-traits", feature = "nightly"))]
+mod eio {
+    use embedded_io::asynch::Write;
+    use embedded_io::Io;
+
+    use super::*;
+
+    impl<T, TxDma, RxDma> Io for Uart<'_, T, TxDma, RxDma>
+    where
+        T: BasicInstance,
+    {
+        type Error = Error;
+    }
+
+    impl<T, TxDma, RxDma> Write for Uart<'_, T, TxDma, RxDma>
+    where
+        T: BasicInstance,
+        TxDma: super::TxDma<T>,
+    {
+        async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
+            self.write(buf).await?;
+            Ok(buf.len())
+        }
+
+        async fn flush(&mut self) -> Result<(), Self::Error> {
+            self.blocking_flush()
+        }
+    }
+
+    impl<T, TxDma> Io for UartTx<'_, T, TxDma>
+    where
+        T: BasicInstance,
+    {
+        type Error = Error;
+    }
+
+    impl<T, TxDma> Write for UartTx<'_, T, TxDma>
+    where
+        T: BasicInstance,
+        TxDma: super::TxDma<T>,
+    {
+        async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
+            self.write(buf).await?;
+            Ok(buf.len())
+        }
+
+        async fn flush(&mut self) -> Result<(), Self::Error> {
+            self.blocking_flush()
         }
     }
 }
@@ -1040,6 +1128,7 @@ pin_trait!(TxPin, BasicInstance);
 pin_trait!(CtsPin, BasicInstance);
 pin_trait!(RtsPin, BasicInstance);
 pin_trait!(CkPin, BasicInstance);
+pin_trait!(DePin, BasicInstance);
 
 dma_trait!(TxDma, BasicInstance);
 dma_trait!(RxDma, BasicInstance);
@@ -1066,7 +1155,7 @@ macro_rules! impl_lpuart {
 
 foreach_interrupt!(
     ($inst:ident, lpuart, $block:ident, $signal_name:ident, $irq:ident) => {
-        impl_lpuart!($inst, $irq, 255);
+        impl_lpuart!($inst, $irq, 256);
     };
 
     ($inst:ident, usart, $block:ident, $signal_name:ident, $irq:ident) => {

@@ -2,10 +2,9 @@
 
 use core::future::poll_fn;
 use core::marker::PhantomData;
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::Poll;
 
-use atomic_polyfill::{AtomicBool, AtomicU8};
 use embassy_hal_common::into_ref;
 use embassy_sync::waitqueue::AtomicWaker;
 use embassy_time::{block_for, Duration};
@@ -35,10 +34,9 @@ static BUS_WAKER: AtomicWaker = NEW_AW;
 static EP0_SETUP: AtomicBool = AtomicBool::new(false);
 static EP_IN_WAKERS: [AtomicWaker; EP_COUNT] = [NEW_AW; EP_COUNT];
 static EP_OUT_WAKERS: [AtomicWaker; EP_COUNT] = [NEW_AW; EP_COUNT];
-static IRQ_FLAGS: AtomicU8 = AtomicU8::new(0);
-const IRQ_FLAG_RESET: u8 = 0x01;
-const IRQ_FLAG_SUSPEND: u8 = 0x02;
-const IRQ_FLAG_RESUME: u8 = 0x04;
+static IRQ_RESET: AtomicBool = AtomicBool::new(false);
+static IRQ_SUSPEND: AtomicBool = AtomicBool::new(false);
+static IRQ_RESUME: AtomicBool = AtomicBool::new(false);
 
 fn convert_type(t: EndpointType) -> EpType {
     match t {
@@ -156,6 +154,7 @@ impl<'d, T: Instance> Driver<'d, T> {
 
             block_for(Duration::from_millis(100));
 
+            #[cfg(not(usb_v4))]
             regs.btable().write(|w| w.set_btable(0));
 
             dp.set_as_af(dp.af_num(), AFType::OutputPushPull);
@@ -184,47 +183,51 @@ impl<'d, T: Instance> Driver<'d, T> {
 
             let istr = regs.istr().read();
 
-            let mut flags: u8 = 0;
-
             if istr.susp() {
                 //trace!("USB IRQ: susp");
-                flags |= IRQ_FLAG_SUSPEND;
+                IRQ_SUSPEND.store(true, Ordering::Relaxed);
                 regs.cntr().modify(|w| {
                     w.set_fsusp(true);
                     w.set_lpmode(true);
-                })
+                });
+
+                // Write 0 to clear.
+                let mut clear = regs::Istr(!0);
+                clear.set_susp(false);
+                regs.istr().write_value(clear);
+
+                // Wake main thread.
+                BUS_WAKER.wake();
             }
 
             if istr.wkup() {
                 //trace!("USB IRQ: wkup");
-                flags |= IRQ_FLAG_RESUME;
+                IRQ_RESUME.store(true, Ordering::Relaxed);
                 regs.cntr().modify(|w| {
                     w.set_fsusp(false);
                     w.set_lpmode(false);
-                })
+                });
+
+                // Write 0 to clear.
+                let mut clear = regs::Istr(!0);
+                clear.set_wkup(false);
+                regs.istr().write_value(clear);
+
+                // Wake main thread.
+                BUS_WAKER.wake();
             }
 
             if istr.reset() {
                 //trace!("USB IRQ: reset");
-                flags |= IRQ_FLAG_RESET;
+                IRQ_RESET.store(true, Ordering::Relaxed);
 
                 // Write 0 to clear.
                 let mut clear = regs::Istr(!0);
                 clear.set_reset(false);
                 regs.istr().write_value(clear);
-            }
 
-            if flags != 0 {
-                // Send irqs to main thread.
-                IRQ_FLAGS.fetch_or(flags, Ordering::AcqRel);
+                // Wake main thread.
                 BUS_WAKER.wake();
-
-                // Clear them
-                let mut mask = regs::Istr(0);
-                mask.set_wkup(true);
-                mask.set_susp(true);
-                mask.set_reset(true);
-                regs.istr().write_value(regs::Istr(!(istr.0 & mask.0)));
             }
 
             if istr.ctr() {
@@ -265,13 +268,13 @@ impl<'d, T: Instance> Driver<'d, T> {
         &mut self,
         ep_type: EndpointType,
         max_packet_size: u16,
-        interval: u8,
+        interval_ms: u8,
     ) -> Result<Endpoint<'d, T, D>, driver::EndpointAllocError> {
         trace!(
-            "allocating type={:?} mps={:?} interval={}, dir={:?}",
+            "allocating type={:?} mps={:?} interval_ms={}, dir={:?}",
             ep_type,
             max_packet_size,
-            interval,
+            interval_ms,
             D::dir()
         );
 
@@ -342,7 +345,7 @@ impl<'d, T: Instance> Driver<'d, T> {
                 addr: EndpointAddress::from_parts(index, D::dir()),
                 ep_type,
                 max_packet_size,
-                interval,
+                interval_ms,
             },
             buf,
         })
@@ -359,18 +362,18 @@ impl<'d, T: Instance> driver::Driver<'d> for Driver<'d, T> {
         &mut self,
         ep_type: EndpointType,
         max_packet_size: u16,
-        interval: u8,
+        interval_ms: u8,
     ) -> Result<Self::EndpointIn, driver::EndpointAllocError> {
-        self.alloc_endpoint(ep_type, max_packet_size, interval)
+        self.alloc_endpoint(ep_type, max_packet_size, interval_ms)
     }
 
     fn alloc_endpoint_out(
         &mut self,
         ep_type: EndpointType,
         max_packet_size: u16,
-        interval: u8,
+        interval_ms: u8,
     ) -> Result<Self::EndpointOut, driver::EndpointAllocError> {
-        self.alloc_endpoint(ep_type, max_packet_size, interval)
+        self.alloc_endpoint(ep_type, max_packet_size, interval_ms)
     }
 
     fn start(mut self, control_max_packet_size: u16) -> (Self::Bus, Self::ControlPipe) {
@@ -436,17 +439,15 @@ impl<'d, T: Instance> driver::Bus for Bus<'d, T> {
             if self.inited {
                 let regs = T::regs();
 
-                let flags = IRQ_FLAGS.load(Ordering::Acquire);
-
-                if flags & IRQ_FLAG_RESUME != 0 {
-                    IRQ_FLAGS.fetch_and(!IRQ_FLAG_RESUME, Ordering::AcqRel);
+                if IRQ_RESUME.load(Ordering::Acquire) {
+                    IRQ_RESUME.store(false, Ordering::Relaxed);
                     return Poll::Ready(Event::Resume);
                 }
 
-                if flags & IRQ_FLAG_RESET != 0 {
-                    IRQ_FLAGS.fetch_and(!IRQ_FLAG_RESET, Ordering::AcqRel);
+                if IRQ_RESET.load(Ordering::Acquire) {
+                    IRQ_RESET.store(false, Ordering::Relaxed);
 
-                    trace!("RESET REGS WRITINGINGING");
+                    trace!("RESET");
                     regs.daddr().write(|w| {
                         w.set_ef(true);
                         w.set_add(0);
@@ -475,8 +476,8 @@ impl<'d, T: Instance> driver::Bus for Bus<'d, T> {
                     return Poll::Ready(Event::Reset);
                 }
 
-                if flags & IRQ_FLAG_SUSPEND != 0 {
-                    IRQ_FLAGS.fetch_and(!IRQ_FLAG_SUSPEND, Ordering::AcqRel);
+                if IRQ_SUSPEND.load(Ordering::Acquire) {
+                    IRQ_SUSPEND.store(false, Ordering::Relaxed);
                     return Poll::Ready(Event::Suspend);
                 }
 
@@ -487,18 +488,6 @@ impl<'d, T: Instance> driver::Bus for Bus<'d, T> {
             }
         })
         .await
-    }
-
-    #[inline]
-    fn set_address(&mut self, addr: u8) {
-        let regs = T::regs();
-        trace!("setting addr: {}", addr);
-        unsafe {
-            regs.daddr().write(|w| {
-                w.set_ef(true);
-                w.set_add(addr);
-            })
-        }
     }
 
     fn endpoint_set_stalled(&mut self, ep_addr: EndpointAddress, stalled: bool) {
@@ -1015,6 +1004,19 @@ impl<'d, T: Instance> driver::ControlPipe for ControlPipe<'d, T> {
                 w.set_ctr_rx(true); // don't clear
                 w.set_ctr_tx(true); // don't clear
             });
+        }
+    }
+
+    async fn accept_set_address(&mut self, addr: u8) {
+        self.accept().await;
+
+        let regs = T::regs();
+        trace!("setting addr: {}", addr);
+        unsafe {
+            regs.daddr().write(|w| {
+                w.set_ef(true);
+                w.set_add(addr);
+            })
         }
     }
 }

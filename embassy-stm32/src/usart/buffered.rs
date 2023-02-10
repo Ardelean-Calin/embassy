@@ -1,8 +1,8 @@
 use core::cell::RefCell;
 use core::future::poll_fn;
+use core::sync::atomic::{compiler_fence, Ordering};
 use core::task::Poll;
 
-use atomic_polyfill::{compiler_fence, Ordering};
 use embassy_cortex_m::peripheral::{PeripheralMutex, PeripheralState, StateStorage};
 use embassy_hal_common::ring_buffer::RingBuffer;
 use embassy_sync::waitqueue::WakerRegistration;
@@ -83,6 +83,33 @@ impl<'d, T: BasicInstance> BufferedUart<'d, T> {
             T::regs().cr3().write(|w| {
                 w.set_rtse(true);
                 w.set_ctse(true);
+            });
+        }
+
+        Self::new_inner(state, peri, rx, tx, irq, tx_buffer, rx_buffer, config)
+    }
+
+    #[cfg(not(usart_v1))]
+    pub fn new_with_de(
+        state: &'d mut State<'d, T>,
+        peri: impl Peripheral<P = T> + 'd,
+        rx: impl Peripheral<P = impl RxPin<T>> + 'd,
+        tx: impl Peripheral<P = impl TxPin<T>> + 'd,
+        irq: impl Peripheral<P = T::Interrupt> + 'd,
+        de: impl Peripheral<P = impl DePin<T>> + 'd,
+        tx_buffer: &'d mut [u8],
+        rx_buffer: &'d mut [u8],
+        config: Config,
+    ) -> BufferedUart<'d, T> {
+        into_ref!(de);
+
+        T::enable();
+        T::reset();
+
+        unsafe {
+            de.set_as_af(de.af_num(), AFType::OutputPushPull);
+            T::regs().cr3().write(|w| {
+                w.set_dem(true);
             });
         }
 

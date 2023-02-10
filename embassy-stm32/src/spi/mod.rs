@@ -10,7 +10,7 @@ pub use embedded_hal_02::spi::{Mode, Phase, Polarity, MODE_0, MODE_1, MODE_2, MO
 use self::sealed::WordSize;
 use crate::dma::{slice_ptr_parts, Transfer};
 use crate::gpio::sealed::{AFType, Pin as _};
-use crate::gpio::AnyPin;
+use crate::gpio::{AnyPin, Pull};
 use crate::pac::spi::{regs, vals, Spi as Regs};
 use crate::rcc::RccPeripheral;
 use crate::time::Hertz;
@@ -93,15 +93,18 @@ impl<'d, T: Instance, Tx, Rx> Spi<'d, T, Tx, Rx> {
         config: Config,
     ) -> Self {
         into_ref!(peri, sck, mosi, miso);
+
+        let sck_pull_mode = match config.mode.polarity {
+            Polarity::IdleLow => Pull::Down,
+            Polarity::IdleHigh => Pull::Up,
+        };
+
         unsafe {
-            sck.set_as_af(sck.af_num(), AFType::OutputPushPull);
-            #[cfg(any(spi_v2, spi_v3, spi_v4))]
+            sck.set_as_af_pull(sck.af_num(), AFType::OutputPushPull, sck_pull_mode);
             sck.set_speed(crate::gpio::Speed::VeryHigh);
             mosi.set_as_af(mosi.af_num(), AFType::OutputPushPull);
-            #[cfg(any(spi_v2, spi_v3, spi_v4))]
             mosi.set_speed(crate::gpio::Speed::VeryHigh);
             miso.set_as_af(miso.af_num(), AFType::Input);
-            #[cfg(any(spi_v2, spi_v3, spi_v4))]
             miso.set_speed(crate::gpio::Speed::VeryHigh);
         }
 
@@ -129,10 +132,8 @@ impl<'d, T: Instance, Tx, Rx> Spi<'d, T, Tx, Rx> {
         into_ref!(sck, miso);
         unsafe {
             sck.set_as_af(sck.af_num(), AFType::OutputPushPull);
-            #[cfg(any(spi_v2, spi_v3, spi_v4))]
             sck.set_speed(crate::gpio::Speed::VeryHigh);
             miso.set_as_af(miso.af_num(), AFType::Input);
-            #[cfg(any(spi_v2, spi_v3, spi_v4))]
             miso.set_speed(crate::gpio::Speed::VeryHigh);
         }
 
@@ -160,10 +161,8 @@ impl<'d, T: Instance, Tx, Rx> Spi<'d, T, Tx, Rx> {
         into_ref!(sck, mosi);
         unsafe {
             sck.set_as_af(sck.af_num(), AFType::OutputPushPull);
-            #[cfg(any(spi_v2, spi_v3, spi_v4))]
             sck.set_speed(crate::gpio::Speed::VeryHigh);
             mosi.set_as_af(mosi.af_num(), AFType::OutputPushPull);
-            #[cfg(any(spi_v2, spi_v3, spi_v4))]
             mosi.set_speed(crate::gpio::Speed::VeryHigh);
         }
 
@@ -474,7 +473,7 @@ impl<'d, T: Instance, Tx, Rx> Spi<'d, T, Tx, Rx> {
         let tx_request = self.txdma.request();
         let tx_dst = T::REGS.tx_ptr();
         let clock_byte = 0x00u8;
-        let tx_f = crate::dma::write_repeated(&mut self.txdma, tx_request, clock_byte, clock_byte_count, tx_dst);
+        let tx_f = crate::dma::write_repeated(&mut self.txdma, tx_request, &clock_byte, clock_byte_count, tx_dst);
 
         unsafe {
             set_txdmaen(T::REGS, true);
@@ -772,10 +771,13 @@ fn finish_dma(regs: Regs) {
         #[cfg(not(any(spi_v3, spi_v4)))]
         while regs.sr().read().bsy() {}
 
+        // Disable the spi peripheral
         regs.cr1().modify(|w| {
             w.set_spe(false);
         });
 
+        // The peripheral automatically disables the DMA stream on completion without error,
+        // but it does not clear the RXDMAEN/TXDMAEN flag in CR2.
         #[cfg(not(any(spi_v3, spi_v4)))]
         regs.cr2().modify(|reg| {
             reg.set_txdmaen(false);

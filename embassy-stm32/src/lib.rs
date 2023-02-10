@@ -58,7 +58,7 @@ pub mod spi;
 pub mod usart;
 #[cfg(all(usb, feature = "time"))]
 pub mod usb;
-#[cfg(any(otgfs, otghs))]
+#[cfg(otg)]
 pub mod usb_otg;
 
 #[cfg(iwdg)]
@@ -121,7 +121,7 @@ pub fn init(config: Config) -> Peripherals {
         #[cfg(dbgmcu)]
         if config.enable_debug_during_sleep {
             crate::pac::DBGMCU.cr().modify(|cr| {
-                #[cfg(any(dbgmcu_f0, dbgmcu_g0, dbgmcu_u5))]
+                #[cfg(any(dbgmcu_f0, dbgmcu_c0, dbgmcu_g0, dbgmcu_u5))]
                 {
                     cr.set_dbg_stop(true);
                     cr.set_dbg_standby(true);
