@@ -713,7 +713,7 @@ impl<'a, T: Instance> Drop for Twim<'a, T> {
         r.enable.write(|w| w.enable().disabled());
         
         // See nrf52832 Errata 89.
-        #[cfg(feature = "52832")]
+        #[cfg(feature = "nrf52832")]
         unsafe {
             r.per_power.write(|w| w.bits(0));
             r.per_power.write(|w| w.bits(1));
