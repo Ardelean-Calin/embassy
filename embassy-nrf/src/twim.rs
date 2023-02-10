@@ -711,6 +711,13 @@ impl<'a, T: Instance> Drop for Twim<'a, T> {
         // disable!
         let r = T::regs();
         r.enable.write(|w| w.enable().disabled());
+        
+        // See nrf52832 Errata 89.
+        #[cfg(feature = "52832")]
+        unsafe {
+            r.per_power.write(|w| w.bits(0));
+            r.per_power.write(|w| w.bits(1));
+        }
 
         gpio::deconfigure_pin(r.psel.sda.read().bits());
         gpio::deconfigure_pin(r.psel.scl.read().bits());
