@@ -8,28 +8,12 @@ export DEFMT_LOG=trace
 
 TARGET=$(rustc -vV | sed -n 's|host: ||p')
 
+BUILD_EXTRA=""
 if [ $TARGET = "x86_64-unknown-linux-gnu" ]; then
     BUILD_EXTRA="--- build --release --manifest-path examples/std/Cargo.toml --target $TARGET --out-dir out/examples/std"
-else
-    BUILD_EXTRA=""
 fi
 
-find . -name '*.rs' -not -path '*target*' -not -path '*stm32-metapac-gen/out/*' -not -path '*stm32-metapac/src/*' | xargs rustfmt --check  --skip-children --unstable-features --edition 2018
-
-# Generate stm32-metapac
-if [ ! -d "stm32-metapac-backup" ]
-then
-    cp -r stm32-metapac stm32-metapac-backup
-fi
-
-rm -rf stm32-metapac
-cp -r stm32-metapac-backup stm32-metapac
-
-# for some reason Cargo stomps the cache if we don't specify --target.
-# This happens with vanilla Cargo, not just cargo-batch. Bug?
-(cd stm32-metapac-gen; cargo run --release --target $TARGET)
-rm -rf stm32-metapac
-mv stm32-metapac-gen/out stm32-metapac
+find . -name '*.rs' -not -path '*target*' | xargs rustfmt --check  --skip-children --unstable-features --edition 2018
 
 cargo batch  \
     --- build --release --manifest-path embassy-executor/Cargo.toml --target thumbv7em-none-eabi --features nightly \
@@ -46,8 +30,8 @@ cargo batch  \
     --- build --release --manifest-path embassy-nrf/Cargo.toml --target thumbv7em-none-eabi --features nightly,nrf52810,gpiote,time-driver-rtc1 \
     --- build --release --manifest-path embassy-nrf/Cargo.toml --target thumbv7em-none-eabi --features nightly,nrf52811,gpiote,time-driver-rtc1 \
     --- build --release --manifest-path embassy-nrf/Cargo.toml --target thumbv7em-none-eabi --features nightly,nrf52820,gpiote,time-driver-rtc1 \
-    --- build --release --manifest-path embassy-nrf/Cargo.toml --target thumbv7em-none-eabi --features nightly,nrf52832,gpiote,time-driver-rtc1 \
-    --- build --release --manifest-path embassy-nrf/Cargo.toml --target thumbv7em-none-eabi --features nightly,nrf52833,gpiote,time-driver-rtc1,unstable-traits \
+    --- build --release --manifest-path embassy-nrf/Cargo.toml --target thumbv7em-none-eabi --features nightly,nrf52832,gpiote,time-driver-rtc1,reset-pin-as-gpio \
+    --- build --release --manifest-path embassy-nrf/Cargo.toml --target thumbv7em-none-eabi --features nightly,nrf52833,gpiote,time-driver-rtc1,unstable-traits,nfc-pins-as-gpio \
     --- build --release --manifest-path embassy-nrf/Cargo.toml --target thumbv8m.main-none-eabihf --features nightly,nrf9160-s,gpiote,time-driver-rtc1 \
     --- build --release --manifest-path embassy-nrf/Cargo.toml --target thumbv8m.main-none-eabihf --features nightly,nrf9160-ns,gpiote,time-driver-rtc1,unstable-traits \
     --- build --release --manifest-path embassy-nrf/Cargo.toml --target thumbv8m.main-none-eabihf --features nightly,nrf5340-app-s,gpiote,time-driver-rtc1,unstable-traits \
@@ -63,6 +47,7 @@ cargo batch  \
     --- build --release --manifest-path embassy-rp/Cargo.toml --target thumbv6m-none-eabi --features nightly,intrinsics \
     --- build --release --manifest-path embassy-stm32/Cargo.toml --target thumbv7em-none-eabi --features nightly,stm32f410tb,defmt,exti,time-driver-any,unstable-traits \
     --- build --release --manifest-path embassy-stm32/Cargo.toml --target thumbv7em-none-eabi --features nightly,stm32f411ce,defmt,exti,time-driver-any,unstable-traits \
+    --- build --release --manifest-path embassy-stm32/Cargo.toml --target thumbv7em-none-eabi --features nightly,stm32f413vh,defmt,exti,time-driver-any,unstable-traits \
     --- build --release --manifest-path embassy-stm32/Cargo.toml --target thumbv7em-none-eabi --features nightly,stm32f429zi,log,exti,time-driver-any,unstable-traits,embedded-sdmmc \
     --- build --release --manifest-path embassy-stm32/Cargo.toml --target thumbv7em-none-eabi --features nightly,stm32h755zi-cm7,defmt,exti,time-driver-any,unstable-traits \
     --- build --release --manifest-path embassy-stm32/Cargo.toml --target thumbv7em-none-eabi --features nightly,stm32h7b3ai,defmt,exti,time-driver-any,unstable-traits \
@@ -132,6 +117,7 @@ cargo batch  \
     --- build --release --manifest-path tests/stm32/Cargo.toml --target thumbv7em-none-eabi --features stm32wb55rg --out-dir out/tests/nucleo-stm32wb55rg \
     --- build --release --manifest-path tests/stm32/Cargo.toml --target thumbv7em-none-eabi --features stm32u585ai --out-dir out/tests/iot-stm32u585ai \
     --- build --release --manifest-path tests/rp/Cargo.toml --target thumbv6m-none-eabi --out-dir out/tests/rpi-pico \
+    --- build --release --manifest-path tests/nrf/Cargo.toml --target thumbv7em-none-eabi --out-dir out/tests/nrf52840-dk \
     $BUILD_EXTRA
 
 

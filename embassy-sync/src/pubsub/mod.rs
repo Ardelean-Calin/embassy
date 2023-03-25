@@ -322,12 +322,15 @@ impl<T: Clone, const CAP: usize, const SUBS: usize, const PUBS: usize> PubSubSta
 
         // We're reading this item, so decrement the counter
         queue_item.1 -= 1;
-        let message = queue_item.0.clone();
 
-        if current_message_index == 0 && queue_item.1 == 0 {
-            self.queue.pop_front();
+        let message = if current_message_index == 0 && queue_item.1 == 0 {
+            let (message, _) = self.queue.pop_front().unwrap();
             self.publisher_wakers.wake();
-        }
+            // Return pop'd message without clone
+            message
+        } else {
+            queue_item.0.clone()
+        };
 
         Some(WaitResult::Message(message))
     }
@@ -371,6 +374,20 @@ impl<T: Clone, const CAP: usize, const SUBS: usize, const PUBS: usize> PubSubSta
                 .iter_mut()
                 .skip(current_message_index)
                 .for_each(|(_, counter)| *counter -= 1);
+
+            let mut wake_publishers = false;
+            while let Some((_, count)) = self.queue.front() {
+                if *count == 0 {
+                    self.queue.pop_front().unwrap();
+                    wake_publishers = true;
+                } else {
+                    break;
+                }
+            }
+
+            if wake_publishers {
+                self.publisher_wakers.wake();
+            }
         }
     }
 
@@ -611,5 +628,59 @@ mod tests {
         assert_eq!(pub0.space(), 3);
         sub1.next_message().await;
         assert_eq!(pub0.space(), 4);
+    }
+
+    #[futures_test::test]
+    async fn empty_channel_when_last_subscriber_is_dropped() {
+        let channel = PubSubChannel::<NoopRawMutex, u32, 4, 4, 4>::new();
+
+        let pub0 = channel.publisher().unwrap();
+        let mut sub0 = channel.subscriber().unwrap();
+        let mut sub1 = channel.subscriber().unwrap();
+
+        assert_eq!(4, pub0.space());
+
+        pub0.publish(1).await;
+        pub0.publish(2).await;
+
+        assert_eq!(2, channel.space());
+
+        assert_eq!(1, sub0.try_next_message_pure().unwrap());
+        assert_eq!(2, sub0.try_next_message_pure().unwrap());
+
+        assert_eq!(2, channel.space());
+
+        drop(sub0);
+
+        assert_eq!(2, channel.space());
+
+        assert_eq!(1, sub1.try_next_message_pure().unwrap());
+
+        assert_eq!(3, channel.space());
+
+        drop(sub1);
+
+        assert_eq!(4, channel.space());
+    }
+
+    struct CloneCallCounter(usize);
+
+    impl Clone for CloneCallCounter {
+        fn clone(&self) -> Self {
+            Self(self.0 + 1)
+        }
+    }
+
+    #[futures_test::test]
+    async fn skip_clone_for_last_message() {
+        let channel = PubSubChannel::<NoopRawMutex, CloneCallCounter, 1, 2, 1>::new();
+        let pub0 = channel.publisher().unwrap();
+        let mut sub0 = channel.subscriber().unwrap();
+        let mut sub1 = channel.subscriber().unwrap();
+
+        pub0.publish(CloneCallCounter(0)).await;
+
+        assert_eq!(1, sub0.try_next_message_pure().unwrap().0);
+        assert_eq!(0, sub1.try_next_message_pure().unwrap().0);
     }
 }
