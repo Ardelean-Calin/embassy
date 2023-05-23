@@ -1,9 +1,5 @@
 #![cfg_attr(not(feature = "std"), no_std)]
-#![cfg_attr(
-    feature = "nightly",
-    feature(type_alias_impl_trait, async_fn_in_trait, impl_trait_projections)
-)]
-#![cfg_attr(feature = "nightly", allow(incomplete_features))]
+#![cfg_attr(feature = "nightly", feature(async_fn_in_trait, impl_trait_projections, try_blocks))]
 #![warn(missing_docs)]
 
 //! Utilities to use `embedded-hal` traits with Embassy.

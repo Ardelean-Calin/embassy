@@ -32,6 +32,11 @@ impl<'d> MsOsDescriptorSet<'d> {
     pub fn is_empty(&self) -> bool {
         self.descriptor.is_empty()
     }
+
+    /// Returns the length of the descriptor field
+    pub fn len(&self) -> usize {
+        self.descriptor.len()
+    }
 }
 
 /// Writes a Microsoft OS 2.0 Descriptor set into a buffer.
@@ -181,7 +186,7 @@ impl<'d> MsOsDescriptorWriter<'d> {
             capability_type::PLATFORM,
             &[
                 0, // reserved
-                // platform capability UUID, Microsoft OS 2.0 platform compabitility
+                // platform capability UUID, Microsoft OS 2.0 platform compatibility
                 0xdf,
                 0x60,
                 0xdd,

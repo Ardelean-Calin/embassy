@@ -22,11 +22,11 @@ jobs:
       id-token: write
       contents: read
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v3
         with:
           submodules: true
       - name: Cache multiple paths
-        uses: actions/cache@v2
+        uses: actions/cache@v3
         with:
           path: |
             ~/.cargo/bin/
@@ -44,11 +44,11 @@ jobs:
   build-stable:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v3
         with:
           submodules: true
       - name: Cache multiple paths
-        uses: actions/cache@v2
+        uses: actions/cache@v3
         with:
           path: |
             ~/.cargo/bin/
@@ -67,11 +67,11 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v3
 
       - name: Test boot
         working-directory: ./embassy-boot/boot
-        run: cargo test && cargo test --features "ed25519-dalek" && cargo test --features "ed25519-salty"
+        run: cargo test && cargo test --features nightly && cargo test --features "ed25519-dalek,nightly" && cargo test --features "ed25519-salty,nightly"
 
       - name: Test sync
         working-directory: ./embassy-sync

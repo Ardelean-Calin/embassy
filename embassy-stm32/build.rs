@@ -3,9 +3,9 @@ use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::{env, fs};
 
-use proc_macro2::TokenStream;
+use proc_macro2::{Ident, TokenStream};
 use quote::{format_ident, quote};
-use stm32_metapac::metadata::METADATA;
+use stm32_metapac::metadata::{MemoryRegionKind, METADATA};
 
 fn main() {
     let chip_name = match env::vars()
@@ -50,9 +50,12 @@ fn main() {
                 // We *shouldn't* have singletons for these, but the HAL currently requires
                 // singletons, for using with RccPeripheral to enable/disable clocks to them.
                 "rcc" => {
-                    if r.version.starts_with("h7") {
+                    if r.version.starts_with("h5") || r.version.starts_with("h7") || r.version.starts_with("f4") {
                         singletons.push("MCO1".to_string());
                         singletons.push("MCO2".to_string());
+                    }
+                    if r.version.starts_with("l4") {
+                        singletons.push("MCO".to_string());
                     }
                     singletons.push(p.name.to_string());
                 }
@@ -78,11 +81,74 @@ fn main() {
         singletons.push(c.name.to_string());
     }
 
+    // ========
+    // Handle time-driver-XXXX features.
+
+    let time_driver = match env::vars()
+        .map(|(a, _)| a)
+        .filter(|x| x.starts_with("CARGO_FEATURE_TIME_DRIVER_"))
+        .get_one()
+    {
+        Ok(x) => Some(
+            x.strip_prefix("CARGO_FEATURE_TIME_DRIVER_")
+                .unwrap()
+                .to_ascii_lowercase(),
+        ),
+        Err(GetOneError::None) => None,
+        Err(GetOneError::Multiple) => panic!("Multiple stm32xx Cargo features enabled"),
+    };
+
+    let time_driver_singleton = match time_driver.as_ref().map(|x| x.as_ref()) {
+        None => "",
+        Some("tim2") => "TIM2",
+        Some("tim3") => "TIM3",
+        Some("tim4") => "TIM4",
+        Some("tim5") => "TIM5",
+        Some("tim12") => "TIM12",
+        Some("tim15") => "TIM15",
+        Some("any") => {
+            if singletons.contains(&"TIM2".to_string()) {
+                "TIM2"
+            } else if singletons.contains(&"TIM3".to_string()) {
+                "TIM3"
+            } else if singletons.contains(&"TIM4".to_string()) {
+                "TIM4"
+            } else if singletons.contains(&"TIM5".to_string()) {
+                "TIM5"
+            } else if singletons.contains(&"TIM12".to_string()) {
+                "TIM12"
+            } else if singletons.contains(&"TIM15".to_string()) {
+                "TIM15"
+            } else {
+                panic!("time-driver-any requested, but the chip doesn't have TIM2, TIM3, TIM4, TIM5, TIM12 or TIM15.")
+            }
+        }
+        _ => panic!("unknown time_driver {:?}", time_driver),
+    };
+
+    if time_driver_singleton != "" {
+        println!("cargo:rustc-cfg=time_driver_{}", time_driver_singleton.to_lowercase());
+    }
+
+    // ========
+    // Write singletons
+
     let mut g = TokenStream::new();
 
     let singleton_tokens: Vec<_> = singletons.iter().map(|s| format_ident!("{}", s)).collect();
+
     g.extend(quote! {
-        embassy_hal_common::peripherals!(#(#singleton_tokens),*);
+        embassy_hal_common::peripherals_definition!(#(#singleton_tokens),*);
+    });
+
+    let singleton_tokens: Vec<_> = singletons
+        .iter()
+        .filter(|s| *s != &time_driver_singleton.to_string())
+        .map(|s| format_ident!("{}", s))
+        .collect();
+
+    g.extend(quote! {
+        embassy_hal_common::peripherals_struct!(#(#singleton_tokens),*);
     });
 
     // ========
@@ -104,9 +170,105 @@ fn main() {
     });
 
     // ========
+    // Generate FLASH regions
+    let mut flash_regions = TokenStream::new();
+    let flash_memory_regions: Vec<_> = METADATA
+        .memory
+        .iter()
+        .filter(|x| x.kind == MemoryRegionKind::Flash && x.settings.is_some())
+        .collect();
+    for region in flash_memory_regions.iter() {
+        let region_name = format_ident!("{}", get_flash_region_name(region.name));
+        let bank_variant = format_ident!(
+            "{}",
+            if region.name.starts_with("BANK_1") {
+                "Bank1"
+            } else if region.name.starts_with("BANK_2") {
+                "Bank2"
+            } else if region.name == "OTP" {
+                "Otp"
+            } else {
+                continue;
+            }
+        );
+        let base = region.address;
+        let size = region.size;
+        let settings = region.settings.as_ref().unwrap();
+        let erase_size = settings.erase_size;
+        let write_size = settings.write_size;
+        let erase_value = settings.erase_value;
+
+        flash_regions.extend(quote! {
+            pub const #region_name: crate::flash::FlashRegion = crate::flash::FlashRegion {
+                bank: crate::flash::FlashBank::#bank_variant,
+                base: #base,
+                size: #size,
+                erase_size: #erase_size,
+                write_size: #write_size,
+                erase_value: #erase_value,
+            };
+        });
+
+        let region_type = format_ident!("{}", get_flash_region_type_name(region.name));
+        flash_regions.extend(quote! {
+            #[cfg(flash)]
+            pub struct #region_type<'d>(pub &'static crate::flash::FlashRegion, pub(crate) embassy_hal_common::PeripheralRef<'d, crate::peripherals::FLASH>,);
+        });
+    }
+
+    let (fields, (inits, region_names)): (Vec<TokenStream>, (Vec<TokenStream>, Vec<Ident>)) = flash_memory_regions
+        .iter()
+        .map(|f| {
+            let region_name = get_flash_region_name(f.name);
+            let field_name = format_ident!("{}", region_name.to_lowercase());
+            let field_type = format_ident!("{}", get_flash_region_type_name(f.name));
+            let field = quote! {
+                pub #field_name: #field_type<'d>
+            };
+            let region_name = format_ident!("{}", region_name);
+            let init = quote! {
+                #field_name: #field_type(&#region_name, unsafe { p.clone_unchecked()})
+            };
+
+            (field, (init, region_name))
+        })
+        .unzip();
+
+    let regions_len = flash_memory_regions.len();
+    flash_regions.extend(quote! {
+        #[cfg(flash)]
+        pub struct FlashLayout<'d> {
+            #(#fields),*
+        }
+
+        #[cfg(flash)]
+        impl<'d> FlashLayout<'d> {
+            pub(crate) fn new(p: embassy_hal_common::PeripheralRef<'d, crate::peripherals::FLASH>) -> Self {
+                Self {
+                    #(#inits),*
+                }
+            }
+        }
+
+        pub const FLASH_REGIONS: [&crate::flash::FlashRegion; #regions_len] = [
+            #(&#region_names),*
+        ];
+    });
+
+    let max_erase_size = flash_memory_regions
+        .iter()
+        .map(|region| region.settings.as_ref().unwrap().erase_size)
+        .max()
+        .unwrap();
+
+    g.extend(quote! { pub const MAX_ERASE_SIZE: usize = #max_erase_size as usize; });
+
+    g.extend(quote! { pub mod flash_regions { #flash_regions } });
+
+    // ========
     // Generate DMA IRQs.
 
-    let mut dma_irqs: HashMap<&str, Vec<(&str, &str)>> = HashMap::new();
+    let mut dma_irqs: HashMap<&str, Vec<(&str, &str, &str)>> = HashMap::new();
 
     for p in METADATA.peripherals {
         if let Some(r) = &p.registers {
@@ -116,7 +278,10 @@ fn main() {
                     continue;
                 }
                 for irq in p.interrupts {
-                    dma_irqs.entry(irq.interrupt).or_default().push((p.name, irq.signal));
+                    dma_irqs
+                        .entry(irq.interrupt)
+                        .or_default()
+                        .push((r.kind, p.name, irq.signal));
                 }
             }
         }
@@ -125,13 +290,14 @@ fn main() {
     for (irq, channels) in dma_irqs {
         let irq = format_ident!("{}", irq);
 
-        let channels = channels.iter().map(|(dma, ch)| format_ident!("{}_{}", dma, ch));
+        let xdma = format_ident!("{}", channels[0].0);
+        let channels = channels.iter().map(|(_, dma, ch)| format_ident!("{}_{}", dma, ch));
 
         g.extend(quote! {
             #[crate::interrupt]
             unsafe fn #irq () {
                 #(
-                    <crate::peripherals::#channels as crate::dma::sealed::Channel>::on_irq();
+                    <crate::peripherals::#channels as crate::dma::#xdma::sealed::Channel>::on_irq();
                 )*
             }
         });
@@ -258,6 +424,7 @@ fn main() {
         (("i2c", "SCL"), quote!(crate::i2c::SclPin)),
         (("rcc", "MCO_1"), quote!(crate::rcc::McoPin)),
         (("rcc", "MCO_2"), quote!(crate::rcc::McoPin)),
+        (("rcc", "MCO"), quote!(crate::rcc::McoPin)),
         (("dcmi", "D0"), quote!(crate::dcmi::D0Pin)),
         (("dcmi", "D1"), quote!(crate::dcmi::D1Pin)),
         (("dcmi", "D2"), quote!(crate::dcmi::D2Pin)),
@@ -427,6 +594,12 @@ fn main() {
         (("sdmmc", "D6"), quote!(crate::sdmmc::D6Pin)),
         (("sdmmc", "D6"), quote!(crate::sdmmc::D7Pin)),
         (("sdmmc", "D8"), quote!(crate::sdmmc::D8Pin)),
+        (("quadspi", "BK1_IO0"), quote!(crate::qspi::D0Pin)),
+        (("quadspi", "BK1_IO1"), quote!(crate::qspi::D1Pin)),
+        (("quadspi", "BK1_IO2"), quote!(crate::qspi::D2Pin)),
+        (("quadspi", "BK1_IO3"), quote!(crate::qspi::D3Pin)),
+        (("quadspi", "CLK"), quote!(crate::qspi::SckPin)),
+        (("quadspi", "BK1_NCS"), quote!(crate::qspi::NSSPin)),
     ].into();
 
     for p in METADATA.peripherals {
@@ -441,8 +614,20 @@ fn main() {
                     // MCO is special
                     if pin.signal.starts_with("MCO_") {
                         // Supported in H7 only for now
-                        if regs.version.starts_with("h7") {
+                        if regs.version.starts_with("h5")
+                            || regs.version.starts_with("h7")
+                            || regs.version.starts_with("f4")
+                        {
                             peri = format_ident!("{}", pin.signal.replace("_", ""));
+                        } else {
+                            continue;
+                        }
+                    }
+
+                    if pin.signal == "MCO" {
+                        // Supported in H7 only for now
+                        if regs.version.starts_with("l4") {
+                            peri = format_ident!("MCO");
                         } else {
                             continue;
                         }
@@ -507,6 +692,7 @@ fn main() {
         (("dcmi", "PSSI"), quote!(crate::dcmi::FrameDma)),
         // SDMMCv1 uses the same channel for both directions, so just implement for RX
         (("sdmmc", "RX"), quote!(crate::sdmmc::SdmmcDma)),
+        (("quadspi", "QUADSPI"), quote!(crate::qspi::QuadDma)),
     ]
     .into();
 
@@ -558,10 +744,24 @@ fn main() {
     // ========
     // Write foreach_foo! macrotables
 
+    let mut flash_regions_table: Vec<Vec<String>> = Vec::new();
     let mut interrupts_table: Vec<Vec<String>> = Vec::new();
     let mut peripherals_table: Vec<Vec<String>> = Vec::new();
     let mut pins_table: Vec<Vec<String>> = Vec::new();
     let mut dma_channels_table: Vec<Vec<String>> = Vec::new();
+
+    for m in METADATA
+        .memory
+        .iter()
+        .filter(|m| m.kind == MemoryRegionKind::Flash && m.settings.is_some())
+    {
+        let settings = m.settings.as_ref().unwrap();
+        let mut row = Vec::new();
+        row.push(get_flash_region_type_name(m.name));
+        row.push(settings.write_size.to_string());
+        row.push(settings.erase_size.to_string());
+        flash_regions_table.push(row);
+    }
 
     let gpio_base = METADATA.peripherals.iter().find(|p| p.name == "GPIOA").unwrap().address as u32;
     let gpio_stride = 0x400;
@@ -659,6 +859,7 @@ fn main() {
 
     let mut m = String::new();
 
+    make_table(&mut m, "foreach_flash_region", &flash_regions_table);
     make_table(&mut m, "foreach_interrupt", &interrupts_table);
     make_table(&mut m, "foreach_peripheral", &peripherals_table);
     make_table(&mut m, "foreach_pin", &pins_table);
@@ -711,51 +912,6 @@ fn main() {
     println!("cargo:rustc-cfg={}", &chip_name[..9]); // stm32f429
     println!("cargo:rustc-cfg={}x", &chip_name[..8]); // stm32f42x
     println!("cargo:rustc-cfg={}x{}", &chip_name[..7], &chip_name[8..9]); // stm32f4x9
-
-    // ========
-    // Handle time-driver-XXXX features.
-
-    let time_driver = match env::vars()
-        .map(|(a, _)| a)
-        .filter(|x| x.starts_with("CARGO_FEATURE_TIME_DRIVER_"))
-        .get_one()
-    {
-        Ok(x) => Some(
-            x.strip_prefix("CARGO_FEATURE_TIME_DRIVER_")
-                .unwrap()
-                .to_ascii_lowercase(),
-        ),
-        Err(GetOneError::None) => None,
-        Err(GetOneError::Multiple) => panic!("Multiple stm32xx Cargo features enabled"),
-    };
-
-    match time_driver.as_ref().map(|x| x.as_ref()) {
-        None => {}
-        Some("tim2") => println!("cargo:rustc-cfg=time_driver_tim2"),
-        Some("tim3") => println!("cargo:rustc-cfg=time_driver_tim3"),
-        Some("tim4") => println!("cargo:rustc-cfg=time_driver_tim4"),
-        Some("tim5") => println!("cargo:rustc-cfg=time_driver_tim5"),
-        Some("tim12") => println!("cargo:rustc-cfg=time_driver_tim12"),
-        Some("tim15") => println!("cargo:rustc-cfg=time_driver_tim15"),
-        Some("any") => {
-            if singletons.contains(&"TIM2".to_string()) {
-                println!("cargo:rustc-cfg=time_driver_tim2");
-            } else if singletons.contains(&"TIM3".to_string()) {
-                println!("cargo:rustc-cfg=time_driver_tim3");
-            } else if singletons.contains(&"TIM4".to_string()) {
-                println!("cargo:rustc-cfg=time_driver_tim4");
-            } else if singletons.contains(&"TIM5".to_string()) {
-                println!("cargo:rustc-cfg=time_driver_tim5");
-            } else if singletons.contains(&"TIM12".to_string()) {
-                println!("cargo:rustc-cfg=time_driver_tim12");
-            } else if singletons.contains(&"TIM15".to_string()) {
-                println!("cargo:rustc-cfg=time_driver_tim15");
-            } else {
-                panic!("time-driver-any requested, but the chip doesn't have TIM2, TIM3, TIM4, TIM5, TIM12 or TIM15.")
-            }
-        }
-        _ => panic!("unknown time_driver {:?}", time_driver),
-    }
 
     // Handle time-driver-XXXX features.
     if env::var("CARGO_FEATURE_TIME_DRIVER_ANY").is_ok() {}
@@ -810,4 +966,20 @@ macro_rules! {} {{
 }}"
     )
     .unwrap();
+}
+
+fn get_flash_region_name(name: &str) -> String {
+    let name = name.replace("BANK_", "BANK").replace("REGION_", "REGION");
+    if name.contains("REGION") {
+        name
+    } else {
+        name + "_REGION"
+    }
+}
+
+fn get_flash_region_type_name(name: &str) -> String {
+    get_flash_region_name(name)
+        .replace("BANK", "Bank")
+        .replace("REGION", "Region")
+        .replace("_", "")
 }

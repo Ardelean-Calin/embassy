@@ -1,16 +1,11 @@
 #![no_std]
-#![feature(type_alias_impl_trait)]
-//! embassy-lora is a collection of async radio drivers that integrate with the lorawan-device
-//! crate's async LoRaWAN MAC implementation.
+#![feature(async_fn_in_trait, impl_trait_projections)]
+//! embassy-lora holds LoRa-specific functionality.
 
 pub(crate) mod fmt;
 
-#[cfg(feature = "stm32wl")]
-pub mod stm32wl;
-#[cfg(feature = "sx126x")]
-pub mod sx126x;
-#[cfg(feature = "sx127x")]
-pub mod sx127x;
+/// interface variants required by the external lora physical layer crate (lora-phy)
+pub mod iv;
 
 #[cfg(feature = "time")]
 use embassy_time::{Duration, Instant, Timer};
@@ -34,13 +29,11 @@ impl lorawan_device::async_device::radio::Timer for LoraTimer {
         self.start = Instant::now();
     }
 
-    type AtFuture<'m> = impl core::future::Future<Output = ()> + 'm;
-    fn at<'m>(&'m mut self, millis: u64) -> Self::AtFuture<'m> {
-        Timer::at(self.start + Duration::from_millis(millis))
+    async fn at(&mut self, millis: u64) {
+        Timer::at(self.start + Duration::from_millis(millis)).await
     }
 
-    type DelayFuture<'m> = impl core::future::Future<Output = ()> + 'm;
-    fn delay_ms<'m>(&'m mut self, millis: u64) -> Self::DelayFuture<'m> {
-        Timer::after(Duration::from_millis(millis))
+    async fn delay_ms(&mut self, millis: u64) {
+        Timer::after(Duration::from_millis(millis)).await
     }
 }

@@ -33,7 +33,7 @@ use core::sync::atomic::{compiler_fence, AtomicBool, Ordering};
 
 use crate::interrupt::{Interrupt, InterruptExt};
 use crate::peripherals::CORE1;
-use crate::{interrupt, pac};
+use crate::{gpio, interrupt, pac};
 
 const PAUSE_TOKEN: u32 = 0xDEADBEEF;
 const RESUME_TOKEN: u32 = !0xDEADBEEF;
@@ -68,6 +68,9 @@ fn install_stack_guard(stack_bottom: *mut usize) {
 #[inline(always)]
 fn core1_setup(stack_bottom: *mut usize) {
     install_stack_guard(stack_bottom);
+    unsafe {
+        gpio::init();
+    }
 }
 
 /// Data type for a properly aligned stack of N bytes
@@ -119,11 +122,16 @@ where
     extern "C" fn core1_startup<F: FnOnce() -> bad::Never>(
         _: u64,
         _: u64,
-        entry: &mut ManuallyDrop<F>,
+        entry: *mut ManuallyDrop<F>,
         stack_bottom: *mut usize,
     ) -> ! {
         core1_setup(stack_bottom);
-        let entry = unsafe { ManuallyDrop::take(entry) };
+
+        let entry = unsafe { ManuallyDrop::take(&mut *entry) };
+
+        // make sure the preceding read doesn't get reordered past the following fifo write
+        compiler_fence(Ordering::SeqCst);
+
         // Signal that it's safe for core 0 to get rid of the original value now.
         fifo_write(1);
 
@@ -145,7 +153,12 @@ where
         psm.frce_off().modify(|w| w.set_proc1(false));
     }
 
-    let mem = unsafe { core::slice::from_raw_parts_mut(stack.mem.as_mut_ptr() as *mut usize, stack.mem.len() / 4) };
+    // The ARM AAPCS ABI requires 8-byte stack alignment.
+    // #[align] on `struct Stack` ensures the bottom is aligned, but the top could still be
+    // unaligned if the user chooses a stack size that's not multiple of 8.
+    // So, we round down to the next multiple of 8.
+    let stack_words = stack.mem.len() / 8 * 2;
+    let mem = unsafe { core::slice::from_raw_parts_mut(stack.mem.as_mut_ptr() as *mut usize, stack_words) };
 
     // Set up the stack
     let mut stack_ptr = unsafe { mem.as_mut_ptr().add(mem.len()) };
@@ -161,7 +174,7 @@ where
 
         // Push `entry`.
         stack_ptr = stack_ptr.sub(1);
-        stack_ptr.cast::<&mut ManuallyDrop<F>>().write(&mut entry);
+        stack_ptr.cast::<*mut ManuallyDrop<F>>().write(&mut entry);
     }
 
     // Make sure the compiler does not reorder the stack writes after to after the

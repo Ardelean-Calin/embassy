@@ -1,6 +1,5 @@
 #![no_std]
 #![cfg_attr(feature = "nightly", feature(async_fn_in_trait, impl_trait_projections))]
-#![cfg_attr(feature = "nightly", allow(incomplete_features))]
 
 // This mod MUST go first, so that the others see its macros.
 pub(crate) mod fmt;
@@ -11,18 +10,16 @@ mod critical_section_impl;
 mod intrinsics;
 
 pub mod adc;
+pub mod clocks;
 pub mod dma;
+pub mod flash;
+mod float;
 pub mod gpio;
 pub mod i2c;
 pub mod interrupt;
-
-#[cfg(feature = "pio")]
-pub mod pio;
-#[cfg(feature = "pio")]
-pub mod pio_instr_util;
-#[cfg(feature = "pio")]
-pub mod relocate;
-
+pub mod multicore;
+pub mod pwm;
+mod reset;
 pub mod rom_data;
 pub mod rtc;
 pub mod spi;
@@ -31,22 +28,22 @@ pub mod timer;
 pub mod uart;
 #[cfg(feature = "nightly")]
 pub mod usb;
-
-pub mod clocks;
-pub mod flash;
-pub mod multicore;
-mod reset;
 pub mod watchdog;
 
-// Reexports
+// PIO
+// TODO: move `pio_instr_util` and `relocate` to inside `pio`
+pub mod pio;
+pub mod pio_instr_util;
+pub mod relocate;
 
+// Reexports
 pub use embassy_cortex_m::executor;
 pub use embassy_cortex_m::interrupt::_export::interrupt;
 pub use embassy_hal_common::{into_ref, Peripheral, PeripheralRef};
 #[cfg(feature = "unstable-pac")]
-pub use rp2040_pac2 as pac;
+pub use rp_pac as pac;
 #[cfg(not(feature = "unstable-pac"))]
-pub(crate) use rp2040_pac2 as pac;
+pub(crate) use rp_pac as pac;
 
 embassy_hal_common::peripherals! {
     PIN_0,
@@ -108,6 +105,15 @@ embassy_hal_common::peripherals! {
     DMA_CH10,
     DMA_CH11,
 
+    PWM_CH0,
+    PWM_CH1,
+    PWM_CH2,
+    PWM_CH3,
+    PWM_CH4,
+    PWM_CH5,
+    PWM_CH6,
+    PWM_CH7,
+
     USB,
 
     RTC,
@@ -124,31 +130,68 @@ embassy_hal_common::peripherals! {
     WATCHDOG,
 }
 
-#[link_section = ".boot2"]
-#[used]
-static BOOT2: [u8; 256] = *include_bytes!("boot2.bin");
+macro_rules! select_bootloader {
+    ( $( $feature:literal => $loader:ident, )+ default => $default:ident ) => {
+        $(
+            #[cfg(feature = $feature)]
+            #[link_section = ".boot2"]
+            #[used]
+            static BOOT2: [u8; 256] = rp2040_boot2::$loader;
+        )*
+
+        #[cfg(not(any( $( feature = $feature),* )))]
+        #[link_section = ".boot2"]
+        #[used]
+        static BOOT2: [u8; 256] = rp2040_boot2::$default;
+    }
+}
+
+select_bootloader! {
+    "boot2-at25sf128a" => BOOT_LOADER_AT25SF128A,
+    "boot2-gd25q64cs" => BOOT_LOADER_GD25Q64CS,
+    "boot2-generic-03h" => BOOT_LOADER_GENERIC_03H,
+    "boot2-is25lp080" => BOOT_LOADER_IS25LP080,
+    "boot2-ram-memcpy" => BOOT_LOADER_RAM_MEMCPY,
+    "boot2-w25q080" => BOOT_LOADER_W25Q080,
+    "boot2-w25x10cl" => BOOT_LOADER_W25X10CL,
+    default => BOOT_LOADER_W25Q080
+}
 
 pub mod config {
+    use crate::clocks::ClockConfig;
+
     #[non_exhaustive]
-    pub struct Config {}
+    pub struct Config {
+        pub clocks: ClockConfig,
+    }
 
     impl Default for Config {
         fn default() -> Self {
-            Self {}
+            Self {
+                clocks: ClockConfig::crystal(12_000_000),
+            }
+        }
+    }
+
+    impl Config {
+        pub fn new(clocks: ClockConfig) -> Self {
+            Self { clocks }
         }
     }
 }
 
-pub fn init(_config: config::Config) -> Peripherals {
+pub fn init(config: config::Config) -> Peripherals {
     // Do this first, so that it panics if user is calling `init` a second time
     // before doing anything important.
     let peripherals = Peripherals::take();
 
     unsafe {
-        clocks::init();
+        clocks::init(config.clocks);
         #[cfg(feature = "time-driver")]
         timer::init();
         dma::init();
+        pio::init();
+        gpio::init();
     }
 
     peripherals

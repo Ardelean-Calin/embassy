@@ -205,7 +205,7 @@ impl<'d, T: Instance> Uarte<'d, T> {
         ppi_ch1: impl Peripheral<P = impl ConfigurableChannel + 'd> + 'd,
         ppi_ch2: impl Peripheral<P = impl ConfigurableChannel + 'd> + 'd,
     ) -> (UarteTx<'d, T>, UarteRxWithIdle<'d, T, U>) {
-        let mut timer = Timer::new(timer);
+        let timer = Timer::new(timer);
 
         into_ref!(ppi_ch1, ppi_ch2);
 
@@ -791,20 +791,18 @@ impl<'d, T: Instance, U: TimerInstance> UarteRxWithIdle<'d, T, U> {
     }
 }
 
-#[cfg(not(any(feature = "_nrf9160", feature = "nrf5340")))]
+#[cfg(not(any(feature = "_nrf9160", feature = "_nrf5340")))]
 pub(crate) fn apply_workaround_for_enable_anomaly(_r: &crate::pac::uarte0::RegisterBlock) {
     // Do nothing
 }
 
-#[cfg(any(feature = "_nrf9160", feature = "nrf5340"))]
+#[cfg(any(feature = "_nrf9160", feature = "_nrf5340"))]
 pub(crate) fn apply_workaround_for_enable_anomaly(r: &crate::pac::uarte0::RegisterBlock) {
-    use core::ops::Deref;
-
     // Apply workaround for anomalies:
     // - nRF9160 - anomaly 23
     // - nRF5340 - anomaly 44
-    let rxenable_reg: *const u32 = ((r.deref() as *const _ as usize) + 0x564) as *const u32;
-    let txenable_reg: *const u32 = ((r.deref() as *const _ as usize) + 0x568) as *const u32;
+    let rxenable_reg: *const u32 = ((r as *const _ as usize) + 0x564) as *const u32;
+    let txenable_reg: *const u32 = ((r as *const _ as usize) + 0x568) as *const u32;
 
     // NB Safety: This is taken from Nordic's driver -
     // https://github.com/NordicSemiconductor/nrfx/blob/master/drivers/src/nrfx_uarte.c#L197
@@ -990,82 +988,5 @@ mod eh1 {
 
     impl<'d, T: Instance> embedded_hal_1::serial::ErrorType for UarteRx<'d, T> {
         type Error = Error;
-    }
-}
-
-#[cfg(all(
-    feature = "unstable-traits",
-    feature = "nightly",
-    feature = "_todo_embedded_hal_serial"
-))]
-mod eha {
-    use core::future::Future;
-
-    use super::*;
-
-    impl<'d, T: Instance> embedded_hal_async::serial::Read for Uarte<'d, T> {
-        type ReadFuture<'a> = impl Future<Output = Result<(), Self::Error>> + 'a where Self: 'a;
-
-        fn read<'a>(&'a mut self, buffer: &'a mut [u8]) -> Self::ReadFuture<'a> {
-            self.read(buffer)
-        }
-    }
-
-    impl<'d, T: Instance> embedded_hal_async::serial::Write for Uarte<'d, T> {
-        type WriteFuture<'a> = impl Future<Output = Result<(), Self::Error>> + 'a where Self: 'a;
-
-        fn write<'a>(&'a mut self, buffer: &'a [u8]) -> Self::WriteFuture<'a> {
-            self.write(buffer)
-        }
-
-        type FlushFuture<'a> = impl Future<Output = Result<(), Self::Error>> + 'a where Self: 'a;
-
-        fn flush(&mut self) -> Result<(), Self::Error> {
-            async move { Ok(()) }
-        }
-    }
-
-    impl<'d, T: Instance> embedded_hal_async::serial::Write for UarteTx<'d, T> {
-        type WriteFuture<'a> = impl Future<Output = Result<(), Self::Error>> + 'a where Self: 'a;
-
-        fn write<'a>(&'a mut self, buffer: &'a [u8]) -> Self::WriteFuture<'a> {
-            self.write(buffer)
-        }
-
-        type FlushFuture<'a> = impl Future<Output = Result<(), Self::Error>> + 'a where Self: 'a;
-
-        fn flush(&mut self) -> Result<(), Self::Error> {
-            async move { Ok(()) }
-        }
-    }
-
-    impl<'d, T: Instance> embedded_hal_async::serial::Read for UarteRx<'d, T> {
-        type ReadFuture<'a> = impl Future<Output = Result<(), Self::Error>> + 'a where Self: 'a;
-
-        fn read<'a>(&'a mut self, buffer: &'a mut [u8]) -> Self::ReadFuture<'a> {
-            self.read(buffer)
-        }
-    }
-
-    impl<'d, U: Instance, T: TimerInstance> embedded_hal_async::serial::Read for UarteWithIdle<'d, U, T> {
-        type ReadFuture<'a> = impl Future<Output = Result<(), Self::Error>> + 'a where Self: 'a;
-
-        fn read<'a>(&'a mut self, buffer: &'a mut [u8]) -> Self::ReadFuture<'a> {
-            self.read(buffer)
-        }
-    }
-
-    impl<'d, U: Instance, T: TimerInstance> embedded_hal_async::serial::Write for UarteWithIdle<'d, U, T> {
-        type WriteFuture<'a> = impl Future<Output = Result<(), Self::Error>> + 'a where Self: 'a;
-
-        fn write<'a>(&'a mut self, buffer: &'a [u8]) -> Self::WriteFuture<'a> {
-            self.write(buffer)
-        }
-
-        type FlushFuture<'a> = impl Future<Output = Result<(), Self::Error>> + 'a where Self: 'a;
-
-        fn flush(&mut self) -> Result<(), Self::Error> {
-            async move { Ok(()) }
-        }
     }
 }

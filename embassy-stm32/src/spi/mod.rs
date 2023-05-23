@@ -7,8 +7,7 @@ use embassy_futures::join::join;
 use embassy_hal_common::{into_ref, PeripheralRef};
 pub use embedded_hal_02::spi::{Mode, Phase, Polarity, MODE_0, MODE_1, MODE_2, MODE_3};
 
-use self::sealed::WordSize;
-use crate::dma::{slice_ptr_parts, Transfer};
+use crate::dma::{slice_ptr_parts, word, Transfer};
 use crate::gpio::sealed::{AFType, Pin as _};
 use crate::gpio::{AnyPin, Pull};
 use crate::pac::spi::{regs, vals, Spi as Regs};
@@ -78,7 +77,7 @@ pub struct Spi<'d, T: Instance, Tx, Rx> {
     miso: Option<PeripheralRef<'d, AnyPin>>,
     txdma: PeripheralRef<'d, Tx>,
     rxdma: PeripheralRef<'d, Rx>,
-    current_word_size: WordSize,
+    current_word_size: word_impl::Config,
 }
 
 impl<'d, T: Instance, Tx, Rx> Spi<'d, T, Tx, Rx> {
@@ -178,16 +177,38 @@ impl<'d, T: Instance, Tx, Rx> Spi<'d, T, Tx, Rx> {
         )
     }
 
-    /// Useful for on chip peripherals like SUBGHZ which are hardwired.
-    /// The bus can optionally be exposed externally with `Spi::new()` still.
-    #[allow(dead_code)]
-    pub(crate) fn new_internal(
+    pub fn new_txonly_nosck(
         peri: impl Peripheral<P = T> + 'd,
+        mosi: impl Peripheral<P = impl MosiPin<T>> + 'd,
         txdma: impl Peripheral<P = Tx> + 'd,
-        rxdma: impl Peripheral<P = Rx> + 'd,
+        rxdma: impl Peripheral<P = Rx> + 'd, // TODO: remove
         freq: Hertz,
         config: Config,
     ) -> Self {
+        into_ref!(mosi);
+        unsafe {
+            mosi.set_as_af_pull(mosi.af_num(), AFType::OutputPushPull, Pull::Down);
+            mosi.set_speed(crate::gpio::Speed::Medium);
+        }
+
+        Self::new_inner(peri, None, Some(mosi.map_into()), None, txdma, rxdma, freq, config)
+    }
+
+    #[cfg(stm32wl)]
+    /// Useful for on chip peripherals like SUBGHZ which are hardwired.
+    pub fn new_subghz(
+        peri: impl Peripheral<P = T> + 'd,
+        txdma: impl Peripheral<P = Tx> + 'd,
+        rxdma: impl Peripheral<P = Rx> + 'd,
+    ) -> Self {
+        // see RM0453 rev 1 section 7.2.13 page 291
+        // The SUBGHZSPI_SCK frequency is obtained by PCLK3 divided by two.
+        // The SUBGHZSPI_SCK clock maximum speed must not exceed 16 MHz.
+        let pclk3_freq = <peripherals::SUBGHZSPI as crate::rcc::sealed::RccPeripheral>::frequency().0;
+        let freq = Hertz(core::cmp::min(pclk3_freq / 2, 16_000_000));
+        let mut config = Config::default();
+        config.mode = MODE_0;
+        config.bit_order = BitOrder::MsbFirst;
         Self::new_inner(peri, None, None, None, txdma, rxdma, freq, config)
     }
 
@@ -234,14 +255,15 @@ impl<'d, T: Instance, Tx, Rx> Spi<'d, T, Tx, Rx> {
                 if mosi.is_none() {
                     w.set_rxonly(vals::Rxonly::OUTPUTDISABLED);
                 }
-                w.set_dff(WordSize::EightBit.dff())
+                w.set_dff(<u8 as sealed::Word>::CONFIG)
             });
         }
         #[cfg(spi_v2)]
         unsafe {
             T::REGS.cr2().modify(|w| {
-                w.set_frxth(WordSize::EightBit.frxth());
-                w.set_ds(WordSize::EightBit.ds());
+                let (ds, frxth) = <u8 as sealed::Word>::CONFIG;
+                w.set_frxth(frxth);
+                w.set_ds(ds);
                 w.set_ssoe(false);
             });
             T::REGS.cr1().modify(|w| {
@@ -258,7 +280,7 @@ impl<'d, T: Instance, Tx, Rx> Spi<'d, T, Tx, Rx> {
                 w.set_spe(true);
             });
         }
-        #[cfg(any(spi_v3, spi_v4))]
+        #[cfg(any(spi_v3, spi_v4, spi_v5))]
         unsafe {
             T::REGS.ifcr().write(|w| w.0 = 0xffff_ffff);
             T::REGS.cfg2().modify(|w| {
@@ -279,7 +301,8 @@ impl<'d, T: Instance, Tx, Rx> Spi<'d, T, Tx, Rx> {
             T::REGS.cfg1().modify(|w| {
                 w.set_crcen(false);
                 w.set_mbr(br);
-                w.set_dsize(WordSize::EightBit.dsize());
+                w.set_dsize(<u8 as sealed::Word>::CONFIG);
+                w.set_fthlv(vals::Fthlv::ONEFRAME);
             });
             T::REGS.cr2().modify(|w| {
                 w.set_tsize(0);
@@ -297,7 +320,7 @@ impl<'d, T: Instance, Tx, Rx> Spi<'d, T, Tx, Rx> {
             miso,
             txdma,
             rxdma,
-            current_word_size: WordSize::EightBit,
+            current_word_size: <u8 as sealed::Word>::CONFIG,
         }
     }
 
@@ -317,7 +340,7 @@ impl<'d, T: Instance, Tx, Rx> Spi<'d, T, Tx, Rx> {
             });
         }
 
-        #[cfg(any(spi_v3, spi_v4))]
+        #[cfg(any(spi_v3, spi_v4, spi_v5))]
         unsafe {
             T::REGS.cfg2().modify(|w| {
                 w.set_cpha(cpha);
@@ -330,7 +353,7 @@ impl<'d, T: Instance, Tx, Rx> Spi<'d, T, Tx, Rx> {
     pub fn get_current_config(&self) -> Config {
         #[cfg(any(spi_v1, spi_f1, spi_v2))]
         let cfg = unsafe { T::REGS.cr1().read() };
-        #[cfg(any(spi_v3, spi_v4))]
+        #[cfg(any(spi_v3, spi_v4, spi_v5))]
         let cfg = unsafe { T::REGS.cfg2().read() };
         let polarity = if cfg.cpol() == vals::Cpol::IDLELOW {
             Polarity::IdleLow
@@ -355,7 +378,7 @@ impl<'d, T: Instance, Tx, Rx> Spi<'d, T, Tx, Rx> {
         }
     }
 
-    fn set_word_size(&mut self, word_size: WordSize) {
+    fn set_word_size(&mut self, word_size: word_impl::Config) {
         if self.current_word_size == word_size {
             return;
         }
@@ -364,7 +387,7 @@ impl<'d, T: Instance, Tx, Rx> Spi<'d, T, Tx, Rx> {
         unsafe {
             T::REGS.cr1().modify(|reg| {
                 reg.set_spe(false);
-                reg.set_dff(word_size.dff())
+                reg.set_dff(word_size)
             });
             T::REGS.cr1().modify(|reg| {
                 reg.set_spe(true);
@@ -376,14 +399,14 @@ impl<'d, T: Instance, Tx, Rx> Spi<'d, T, Tx, Rx> {
                 w.set_spe(false);
             });
             T::REGS.cr2().modify(|w| {
-                w.set_frxth(word_size.frxth());
-                w.set_ds(word_size.ds());
+                w.set_frxth(word_size.1);
+                w.set_ds(word_size.0);
             });
             T::REGS.cr1().modify(|w| {
                 w.set_spe(true);
             });
         }
-        #[cfg(any(spi_v3, spi_v4))]
+        #[cfg(any(spi_v3, spi_v4, spi_v5))]
         unsafe {
             T::REGS.cr1().modify(|w| {
                 w.set_csusp(true);
@@ -393,7 +416,7 @@ impl<'d, T: Instance, Tx, Rx> Spi<'d, T, Tx, Rx> {
                 w.set_spe(false);
             });
             T::REGS.cfg1().modify(|w| {
-                w.set_dsize(word_size.dsize());
+                w.set_dsize(word_size);
             });
             T::REGS.cr1().modify(|w| {
                 w.set_csusp(false);
@@ -412,7 +435,7 @@ impl<'d, T: Instance, Tx, Rx> Spi<'d, T, Tx, Rx> {
             return Ok(());
         }
 
-        self.set_word_size(W::WORDSIZE);
+        self.set_word_size(W::CONFIG);
         unsafe {
             T::REGS.cr1().modify(|w| {
                 w.set_spe(false);
@@ -421,15 +444,14 @@ impl<'d, T: Instance, Tx, Rx> Spi<'d, T, Tx, Rx> {
 
         let tx_request = self.txdma.request();
         let tx_dst = T::REGS.tx_ptr();
-        unsafe { self.txdma.start_write(tx_request, data, tx_dst, Default::default()) }
-        let tx_f = Transfer::new(&mut self.txdma);
+        let tx_f = unsafe { Transfer::new_write(&mut self.txdma, tx_request, data, tx_dst, Default::default()) };
 
         unsafe {
             set_txdmaen(T::REGS, true);
             T::REGS.cr1().modify(|w| {
                 w.set_spe(true);
             });
-            #[cfg(any(spi_v3, spi_v4))]
+            #[cfg(any(spi_v3, spi_v4, spi_v5))]
             T::REGS.cr1().modify(|w| {
                 w.set_cstart(true);
             });
@@ -451,7 +473,7 @@ impl<'d, T: Instance, Tx, Rx> Spi<'d, T, Tx, Rx> {
             return Ok(());
         }
 
-        self.set_word_size(W::WORDSIZE);
+        self.set_word_size(W::CONFIG);
         unsafe {
             T::REGS.cr1().modify(|w| {
                 w.set_spe(false);
@@ -459,7 +481,7 @@ impl<'d, T: Instance, Tx, Rx> Spi<'d, T, Tx, Rx> {
         }
 
         // SPIv3 clears rxfifo on SPE=0
-        #[cfg(not(any(spi_v3, spi_v4)))]
+        #[cfg(not(any(spi_v3, spi_v4, spi_v5)))]
         flush_rx_fifo(T::REGS);
 
         set_rxdmaen(T::REGS, true);
@@ -468,20 +490,28 @@ impl<'d, T: Instance, Tx, Rx> Spi<'d, T, Tx, Rx> {
 
         let rx_request = self.rxdma.request();
         let rx_src = T::REGS.rx_ptr();
-        unsafe { self.rxdma.start_read(rx_request, rx_src, data, Default::default()) };
-        let rx_f = Transfer::new(&mut self.rxdma);
+        let rx_f = unsafe { Transfer::new_read(&mut self.rxdma, rx_request, rx_src, data, Default::default()) };
 
         let tx_request = self.txdma.request();
         let tx_dst = T::REGS.tx_ptr();
         let clock_byte = 0x00u8;
-        let tx_f = crate::dma::write_repeated(&mut self.txdma, tx_request, &clock_byte, clock_byte_count, tx_dst);
+        let tx_f = unsafe {
+            Transfer::new_write_repeated(
+                &mut self.txdma,
+                tx_request,
+                &clock_byte,
+                clock_byte_count,
+                tx_dst,
+                Default::default(),
+            )
+        };
 
         unsafe {
             set_txdmaen(T::REGS, true);
             T::REGS.cr1().modify(|w| {
                 w.set_spe(true);
             });
-            #[cfg(any(spi_v3, spi_v4))]
+            #[cfg(any(spi_v3, spi_v4, spi_v5))]
             T::REGS.cr1().modify(|w| {
                 w.set_cstart(true);
             });
@@ -506,7 +536,7 @@ impl<'d, T: Instance, Tx, Rx> Spi<'d, T, Tx, Rx> {
             return Ok(());
         }
 
-        self.set_word_size(W::WORDSIZE);
+        self.set_word_size(W::CONFIG);
         unsafe {
             T::REGS.cr1().modify(|w| {
                 w.set_spe(false);
@@ -514,27 +544,25 @@ impl<'d, T: Instance, Tx, Rx> Spi<'d, T, Tx, Rx> {
         }
 
         // SPIv3 clears rxfifo on SPE=0
-        #[cfg(not(any(spi_v3, spi_v4)))]
+        #[cfg(not(any(spi_v3, spi_v4, spi_v5)))]
         flush_rx_fifo(T::REGS);
 
         set_rxdmaen(T::REGS, true);
 
         let rx_request = self.rxdma.request();
         let rx_src = T::REGS.rx_ptr();
-        unsafe { self.rxdma.start_read(rx_request, rx_src, read, Default::default()) };
-        let rx_f = Transfer::new(&mut self.rxdma);
+        let rx_f = unsafe { Transfer::new_read_raw(&mut self.rxdma, rx_request, rx_src, read, Default::default()) };
 
         let tx_request = self.txdma.request();
         let tx_dst = T::REGS.tx_ptr();
-        unsafe { self.txdma.start_write(tx_request, write, tx_dst, Default::default()) }
-        let tx_f = Transfer::new(&mut self.txdma);
+        let tx_f = unsafe { Transfer::new_write_raw(&mut self.txdma, tx_request, write, tx_dst, Default::default()) };
 
         unsafe {
             set_txdmaen(T::REGS, true);
             T::REGS.cr1().modify(|w| {
                 w.set_spe(true);
             });
-            #[cfg(any(spi_v3, spi_v4))]
+            #[cfg(any(spi_v3, spi_v4, spi_v5))]
             T::REGS.cr1().modify(|w| {
                 w.set_cstart(true);
             });
@@ -566,7 +594,7 @@ impl<'d, T: Instance, Tx, Rx> Spi<'d, T, Tx, Rx> {
     pub fn blocking_write<W: Word>(&mut self, words: &[W]) -> Result<(), Error> {
         unsafe { T::REGS.cr1().modify(|w| w.set_spe(true)) }
         flush_rx_fifo(T::REGS);
-        self.set_word_size(W::WORDSIZE);
+        self.set_word_size(W::CONFIG);
         for word in words.iter() {
             let _ = transfer_word(T::REGS, *word)?;
         }
@@ -576,7 +604,7 @@ impl<'d, T: Instance, Tx, Rx> Spi<'d, T, Tx, Rx> {
     pub fn blocking_read<W: Word>(&mut self, words: &mut [W]) -> Result<(), Error> {
         unsafe { T::REGS.cr1().modify(|w| w.set_spe(true)) }
         flush_rx_fifo(T::REGS);
-        self.set_word_size(W::WORDSIZE);
+        self.set_word_size(W::CONFIG);
         for word in words.iter_mut() {
             *word = transfer_word(T::REGS, W::default())?;
         }
@@ -586,7 +614,7 @@ impl<'d, T: Instance, Tx, Rx> Spi<'d, T, Tx, Rx> {
     pub fn blocking_transfer_in_place<W: Word>(&mut self, words: &mut [W]) -> Result<(), Error> {
         unsafe { T::REGS.cr1().modify(|w| w.set_spe(true)) }
         flush_rx_fifo(T::REGS);
-        self.set_word_size(W::WORDSIZE);
+        self.set_word_size(W::CONFIG);
         for word in words.iter_mut() {
             *word = transfer_word(T::REGS, *word)?;
         }
@@ -596,7 +624,7 @@ impl<'d, T: Instance, Tx, Rx> Spi<'d, T, Tx, Rx> {
     pub fn blocking_transfer<W: Word>(&mut self, read: &mut [W], write: &[W]) -> Result<(), Error> {
         unsafe { T::REGS.cr1().modify(|w| w.set_spe(true)) }
         flush_rx_fifo(T::REGS);
-        self.set_word_size(W::WORDSIZE);
+        self.set_word_size(W::CONFIG);
         let len = read.len().max(write.len());
         for i in 0..len {
             let wb = write.get(i).copied().unwrap_or_default();
@@ -619,9 +647,9 @@ impl<'d, T: Instance, Tx, Rx> Drop for Spi<'d, T, Tx, Rx> {
     }
 }
 
-#[cfg(not(any(spi_v3, spi_v4)))]
+#[cfg(not(any(spi_v3, spi_v4, spi_v5)))]
 use vals::Br;
-#[cfg(any(spi_v3, spi_v4))]
+#[cfg(any(spi_v3, spi_v4, spi_v5))]
 use vals::Mbr as Br;
 
 fn compute_baud_rate(clocks: Hertz, freq: Hertz) -> Br {
@@ -647,17 +675,17 @@ trait RegsExt {
 
 impl RegsExt for Regs {
     fn tx_ptr<W>(&self) -> *mut W {
-        #[cfg(not(any(spi_v3, spi_v4)))]
+        #[cfg(not(any(spi_v3, spi_v4, spi_v5)))]
         let dr = self.dr();
-        #[cfg(any(spi_v3, spi_v4))]
+        #[cfg(any(spi_v3, spi_v4, spi_v5))]
         let dr = self.txdr();
         dr.ptr() as *mut W
     }
 
     fn rx_ptr<W>(&self) -> *mut W {
-        #[cfg(not(any(spi_v3, spi_v4)))]
+        #[cfg(not(any(spi_v3, spi_v4, spi_v5)))]
         let dr = self.dr();
-        #[cfg(any(spi_v3, spi_v4))]
+        #[cfg(any(spi_v3, spi_v4, spi_v5))]
         let dr = self.rxdr();
         dr.ptr() as *mut W
     }
@@ -667,22 +695,22 @@ fn check_error_flags(sr: regs::Sr) -> Result<(), Error> {
     if sr.ovr() {
         return Err(Error::Overrun);
     }
-    #[cfg(not(any(spi_f1, spi_v3, spi_v4)))]
+    #[cfg(not(any(spi_f1, spi_v3, spi_v4, spi_v5)))]
     if sr.fre() {
         return Err(Error::Framing);
     }
-    #[cfg(any(spi_v3, spi_v4))]
+    #[cfg(any(spi_v3, spi_v4, spi_v5))]
     if sr.tifre() {
         return Err(Error::Framing);
     }
     if sr.modf() {
         return Err(Error::ModeFault);
     }
-    #[cfg(not(any(spi_v3, spi_v4)))]
+    #[cfg(not(any(spi_v3, spi_v4, spi_v5)))]
     if sr.crcerr() {
         return Err(Error::Crc);
     }
-    #[cfg(any(spi_v3, spi_v4))]
+    #[cfg(any(spi_v3, spi_v4, spi_v5))]
     if sr.crce() {
         return Err(Error::Crc);
     }
@@ -696,11 +724,11 @@ fn spin_until_tx_ready(regs: Regs) -> Result<(), Error> {
 
         check_error_flags(sr)?;
 
-        #[cfg(not(any(spi_v3, spi_v4)))]
+        #[cfg(not(any(spi_v3, spi_v4, spi_v5)))]
         if sr.txe() {
             return Ok(());
         }
-        #[cfg(any(spi_v3, spi_v4))]
+        #[cfg(any(spi_v3, spi_v4, spi_v5))]
         if sr.txp() {
             return Ok(());
         }
@@ -713,11 +741,11 @@ fn spin_until_rx_ready(regs: Regs) -> Result<(), Error> {
 
         check_error_flags(sr)?;
 
-        #[cfg(not(any(spi_v3, spi_v4)))]
+        #[cfg(not(any(spi_v3, spi_v4, spi_v5)))]
         if sr.rxne() {
             return Ok(());
         }
-        #[cfg(any(spi_v3, spi_v4))]
+        #[cfg(any(spi_v3, spi_v4, spi_v5))]
         if sr.rxp() {
             return Ok(());
         }
@@ -726,11 +754,11 @@ fn spin_until_rx_ready(regs: Regs) -> Result<(), Error> {
 
 fn flush_rx_fifo(regs: Regs) {
     unsafe {
-        #[cfg(not(any(spi_v3, spi_v4)))]
+        #[cfg(not(any(spi_v3, spi_v4, spi_v5)))]
         while regs.sr().read().rxne() {
             let _ = regs.dr().read();
         }
-        #[cfg(any(spi_v3, spi_v4))]
+        #[cfg(any(spi_v3, spi_v4, spi_v5))]
         while regs.sr().read().rxp() {
             let _ = regs.rxdr().read();
         }
@@ -739,11 +767,11 @@ fn flush_rx_fifo(regs: Regs) {
 
 fn set_txdmaen(regs: Regs, val: bool) {
     unsafe {
-        #[cfg(not(any(spi_v3, spi_v4)))]
+        #[cfg(not(any(spi_v3, spi_v4, spi_v5)))]
         regs.cr2().modify(|reg| {
             reg.set_txdmaen(val);
         });
-        #[cfg(any(spi_v3, spi_v4))]
+        #[cfg(any(spi_v3, spi_v4, spi_v5))]
         regs.cfg1().modify(|reg| {
             reg.set_txdmaen(val);
         });
@@ -752,11 +780,11 @@ fn set_txdmaen(regs: Regs, val: bool) {
 
 fn set_rxdmaen(regs: Regs, val: bool) {
     unsafe {
-        #[cfg(not(any(spi_v3, spi_v4)))]
+        #[cfg(not(any(spi_v3, spi_v4, spi_v5)))]
         regs.cr2().modify(|reg| {
             reg.set_rxdmaen(val);
         });
-        #[cfg(any(spi_v3, spi_v4))]
+        #[cfg(any(spi_v3, spi_v4, spi_v5))]
         regs.cfg1().modify(|reg| {
             reg.set_rxdmaen(val);
         });
@@ -768,9 +796,9 @@ fn finish_dma(regs: Regs) {
         #[cfg(spi_v2)]
         while regs.sr().read().ftlvl() > 0 {}
 
-        #[cfg(any(spi_v3, spi_v4))]
+        #[cfg(any(spi_v3, spi_v4, spi_v5))]
         while !regs.sr().read().txc() {}
-        #[cfg(not(any(spi_v3, spi_v4)))]
+        #[cfg(not(any(spi_v3, spi_v4, spi_v5)))]
         while regs.sr().read().bsy() {}
 
         // Disable the spi peripheral
@@ -780,12 +808,12 @@ fn finish_dma(regs: Regs) {
 
         // The peripheral automatically disables the DMA stream on completion without error,
         // but it does not clear the RXDMAEN/TXDMAEN flag in CR2.
-        #[cfg(not(any(spi_v3, spi_v4)))]
+        #[cfg(not(any(spi_v3, spi_v4, spi_v5)))]
         regs.cr2().modify(|reg| {
             reg.set_txdmaen(false);
             reg.set_rxdmaen(false);
         });
-        #[cfg(any(spi_v3, spi_v4))]
+        #[cfg(any(spi_v3, spi_v4, spi_v5))]
         regs.cfg1().modify(|reg| {
             reg.set_txdmaen(false);
             reg.set_rxdmaen(false);
@@ -799,7 +827,7 @@ fn transfer_word<W: Word>(regs: Regs, tx_word: W) -> Result<W, Error> {
     unsafe {
         ptr::write_volatile(regs.tx_ptr(), tx_word);
 
-        #[cfg(any(spi_v3, spi_v4))]
+        #[cfg(any(spi_v3, spi_v4, spi_v5))]
         regs.cr1().modify(|reg| reg.set_cstart(true));
     }
 
@@ -928,70 +956,89 @@ pub(crate) mod sealed {
         const REGS: Regs;
     }
 
-    pub trait Word: Copy + 'static {
-        const WORDSIZE: WordSize;
-    }
-
-    impl Word for u8 {
-        const WORDSIZE: WordSize = WordSize::EightBit;
-    }
-    impl Word for u16 {
-        const WORDSIZE: WordSize = WordSize::SixteenBit;
-    }
-
-    #[derive(Copy, Clone, PartialOrd, PartialEq)]
-    pub enum WordSize {
-        EightBit,
-        SixteenBit,
-    }
-
-    impl WordSize {
-        #[cfg(any(spi_v1, spi_f1))]
-        pub fn dff(&self) -> vals::Dff {
-            match self {
-                WordSize::EightBit => vals::Dff::EIGHTBIT,
-                WordSize::SixteenBit => vals::Dff::SIXTEENBIT,
-            }
-        }
-
-        #[cfg(spi_v2)]
-        pub fn ds(&self) -> vals::Ds {
-            match self {
-                WordSize::EightBit => vals::Ds::EIGHTBIT,
-                WordSize::SixteenBit => vals::Ds::SIXTEENBIT,
-            }
-        }
-
-        #[cfg(spi_v2)]
-        pub fn frxth(&self) -> vals::Frxth {
-            match self {
-                WordSize::EightBit => vals::Frxth::QUARTER,
-                WordSize::SixteenBit => vals::Frxth::HALF,
-            }
-        }
-
-        #[cfg(any(spi_v3, spi_v4))]
-        pub fn dsize(&self) -> u8 {
-            match self {
-                WordSize::EightBit => 0b0111,
-                WordSize::SixteenBit => 0b1111,
-            }
-        }
-
-        #[cfg(any(spi_v3, spi_v4))]
-        pub fn _frxth(&self) -> vals::Fthlv {
-            match self {
-                WordSize::EightBit => vals::Fthlv::ONEFRAME,
-                WordSize::SixteenBit => vals::Fthlv::ONEFRAME,
-            }
-        }
+    pub trait Word {
+        const CONFIG: word_impl::Config;
     }
 }
 
-pub trait Word: Copy + 'static + sealed::Word + Default + crate::dma::Word {}
+pub trait Word: word::Word + sealed::Word {}
 
-impl Word for u8 {}
-impl Word for u16 {}
+macro_rules! impl_word {
+    ($T:ty, $config:expr) => {
+        impl sealed::Word for $T {
+            const CONFIG: Config = $config;
+        }
+        impl Word for $T {}
+    };
+}
+
+#[cfg(any(spi_v1, spi_f1))]
+mod word_impl {
+    use super::*;
+
+    pub type Config = vals::Dff;
+
+    impl_word!(u8, vals::Dff::EIGHTBIT);
+    impl_word!(u16, vals::Dff::SIXTEENBIT);
+}
+
+#[cfg(any(spi_v2))]
+mod word_impl {
+    use super::*;
+
+    pub type Config = (vals::Ds, vals::Frxth);
+
+    impl_word!(word::U4, (vals::Ds::FOURBIT, vals::Frxth::QUARTER));
+    impl_word!(word::U5, (vals::Ds::FIVEBIT, vals::Frxth::QUARTER));
+    impl_word!(word::U6, (vals::Ds::SIXBIT, vals::Frxth::QUARTER));
+    impl_word!(word::U7, (vals::Ds::SEVENBIT, vals::Frxth::QUARTER));
+    impl_word!(u8, (vals::Ds::EIGHTBIT, vals::Frxth::QUARTER));
+    impl_word!(word::U9, (vals::Ds::NINEBIT, vals::Frxth::HALF));
+    impl_word!(word::U10, (vals::Ds::TENBIT, vals::Frxth::HALF));
+    impl_word!(word::U11, (vals::Ds::ELEVENBIT, vals::Frxth::HALF));
+    impl_word!(word::U12, (vals::Ds::TWELVEBIT, vals::Frxth::HALF));
+    impl_word!(word::U13, (vals::Ds::THIRTEENBIT, vals::Frxth::HALF));
+    impl_word!(word::U14, (vals::Ds::FOURTEENBIT, vals::Frxth::HALF));
+    impl_word!(word::U15, (vals::Ds::FIFTEENBIT, vals::Frxth::HALF));
+    impl_word!(u16, (vals::Ds::SIXTEENBIT, vals::Frxth::HALF));
+}
+
+#[cfg(any(spi_v3, spi_v4, spi_v5))]
+mod word_impl {
+    use super::*;
+
+    pub type Config = u8;
+
+    impl_word!(word::U4, 4 - 1);
+    impl_word!(word::U5, 5 - 1);
+    impl_word!(word::U6, 6 - 1);
+    impl_word!(word::U7, 7 - 1);
+    impl_word!(u8, 8 - 1);
+    impl_word!(word::U9, 9 - 1);
+    impl_word!(word::U10, 10 - 1);
+    impl_word!(word::U11, 11 - 1);
+    impl_word!(word::U12, 12 - 1);
+    impl_word!(word::U13, 13 - 1);
+    impl_word!(word::U14, 14 - 1);
+    impl_word!(word::U15, 15 - 1);
+    impl_word!(u16, 16 - 1);
+    impl_word!(word::U17, 17 - 1);
+    impl_word!(word::U18, 18 - 1);
+    impl_word!(word::U19, 19 - 1);
+    impl_word!(word::U20, 20 - 1);
+    impl_word!(word::U21, 21 - 1);
+    impl_word!(word::U22, 22 - 1);
+    impl_word!(word::U23, 23 - 1);
+    impl_word!(word::U24, 24 - 1);
+    impl_word!(word::U25, 25 - 1);
+    impl_word!(word::U26, 26 - 1);
+    impl_word!(word::U27, 27 - 1);
+    impl_word!(word::U28, 28 - 1);
+    impl_word!(word::U29, 29 - 1);
+    impl_word!(word::U30, 30 - 1);
+    impl_word!(word::U31, 31 - 1);
+    impl_word!(u32, 32 - 1);
+}
 
 pub trait Instance: Peripheral<P = Self> + sealed::Instance + RccPeripheral {}
 pin_trait!(SckPin, Instance);

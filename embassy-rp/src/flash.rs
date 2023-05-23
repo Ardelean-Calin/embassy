@@ -25,7 +25,7 @@ pub const ERASE_SIZE: usize = 4096;
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum Error {
-    /// Opration using a location not in flash.
+    /// Operation using a location not in flash.
     OutOfBounds,
     /// Unaligned operation or using unaligned buffers.
     Unaligned,
@@ -162,8 +162,6 @@ impl<'d, T: Instance, const FLASH_SIZE: usize> Flash<'d, T, FLASH_SIZE> {
     /// - interrupts must be disabled
     /// - DMA must not access flash memory
     unsafe fn in_ram(&mut self, operation: impl FnOnce()) -> Result<(), Error> {
-        let dma_status = &mut [false; crate::dma::CHANNEL_COUNT];
-
         // Make sure we're running on CORE0
         let core_id: u32 = unsafe { pac::SIO.cpuid().read() };
         if core_id != 0 {
@@ -174,30 +172,37 @@ impl<'d, T: Instance, const FLASH_SIZE: usize> Flash<'d, T, FLASH_SIZE> {
         crate::multicore::pause_core1();
 
         critical_section::with(|_| {
-            // Pause all DMA channels for the duration of the ram operation
-            for (number, status) in dma_status.iter_mut().enumerate() {
-                let ch = crate::pac::DMA.ch(number as _);
-                *status = ch.ctrl_trig().read().en();
-                if *status {
-                    ch.ctrl_trig().modify(|w| w.set_en(false));
-                }
+            // Wait for all DMA channels in flash to finish before ram operation
+            const SRAM_LOWER: u32 = 0x2000_0000;
+            for n in 0..crate::dma::CHANNEL_COUNT {
+                let ch = crate::pac::DMA.ch(n);
+                while ch.read_addr().read() < SRAM_LOWER && ch.ctrl_trig().read().busy() {}
             }
 
             // Run our flash operation in RAM
             operation();
-
-            // Re-enable previously enabled DMA channels
-            for (number, status) in dma_status.iter().enumerate() {
-                let ch = crate::pac::DMA.ch(number as _);
-                if *status {
-                    ch.ctrl_trig().modify(|w| w.set_en(true));
-                }
-            }
         });
 
         // Resume CORE1 execution
         crate::multicore::resume_core1();
         Ok(())
+    }
+
+    /// Read SPI flash unique ID
+    pub fn unique_id(&mut self, uid: &mut [u8]) -> Result<(), Error> {
+        unsafe { self.in_ram(|| ram_helpers::flash_unique_id(uid, true))? };
+        Ok(())
+    }
+
+    /// Read SPI flash JEDEC ID
+    pub fn jedec_id(&mut self) -> Result<u32, Error> {
+        let mut jedec = None;
+        unsafe {
+            self.in_ram(|| {
+                jedec.replace(ram_helpers::flash_jedec_id(true));
+            })?;
+        };
+        Ok(jedec.unwrap())
     }
 }
 
@@ -466,6 +471,220 @@ mod ram_helpers {
             lateout("r8") _,
             lateout("r9") _,
             lateout("r10") _,
+            clobber_abi("C"),
+        );
+    }
+
+    #[repr(C)]
+    struct FlashCommand {
+        cmd_addr: *const u8,
+        cmd_addr_len: u32,
+        dummy_len: u32,
+        data: *mut u8,
+        data_len: u32,
+    }
+
+    /// Return SPI flash unique ID
+    ///
+    /// Not all SPI flashes implement this command, so check the JEDEC
+    /// ID before relying on it. The Winbond parts commonly seen on
+    /// RP2040 devboards (JEDEC=0xEF7015) support an 8-byte unique ID;
+    /// https://forums.raspberrypi.com/viewtopic.php?t=331949 suggests
+    /// that LCSC (Zetta) parts have a 16-byte unique ID (which is
+    /// *not* unique in just its first 8 bytes),
+    /// JEDEC=0xBA6015. Macronix and Spansion parts do not have a
+    /// unique ID.
+    ///
+    /// The returned bytes are relatively predictable and should be
+    /// salted and hashed before use if that is an issue (e.g. for MAC
+    /// addresses).
+    ///
+    /// # Safety
+    ///
+    /// Nothing must access flash while this is running.
+    /// Usually this means:
+    ///   - interrupts must be disabled
+    ///   - 2nd core must be running code from RAM or ROM with interrupts disabled
+    ///   - DMA must not access flash memory
+    ///
+    /// Credit: taken from `rp2040-flash` (also licensed Apache+MIT)
+    pub unsafe fn flash_unique_id(out: &mut [u8], use_boot2: bool) {
+        let mut boot2 = [0u32; 256 / 4];
+        let ptrs = if use_boot2 {
+            rom_data::memcpy44(&mut boot2 as *mut _, 0x10000000 as *const _, 256);
+            flash_function_pointers_with_boot2(false, false, &boot2)
+        } else {
+            flash_function_pointers(false, false)
+        };
+        // 4B - read unique ID
+        let cmd = [0x4B];
+        read_flash(&cmd[..], 4, out, &ptrs as *const FlashFunctionPointers);
+    }
+
+    /// Return SPI flash JEDEC ID
+    ///
+    /// This is the three-byte manufacturer-and-model identifier
+    /// commonly used to check before using manufacturer-specific SPI
+    /// flash features, e.g. 0xEF7015 for Winbond W25Q16JV.
+    ///
+    /// # Safety
+    ///
+    /// Nothing must access flash while this is running.
+    /// Usually this means:
+    ///   - interrupts must be disabled
+    ///   - 2nd core must be running code from RAM or ROM with interrupts disabled
+    ///   - DMA must not access flash memory
+    ///
+    /// Credit: taken from `rp2040-flash` (also licensed Apache+MIT)
+    pub unsafe fn flash_jedec_id(use_boot2: bool) -> u32 {
+        let mut boot2 = [0u32; 256 / 4];
+        let ptrs = if use_boot2 {
+            rom_data::memcpy44(&mut boot2 as *mut _, 0x10000000 as *const _, 256);
+            flash_function_pointers_with_boot2(false, false, &boot2)
+        } else {
+            flash_function_pointers(false, false)
+        };
+        let mut id = [0u8; 4];
+        // 9F - read JEDEC ID
+        let cmd = [0x9F];
+        read_flash(&cmd[..], 0, &mut id[1..4], &ptrs as *const FlashFunctionPointers);
+        u32::from_be_bytes(id)
+    }
+
+    unsafe fn read_flash(cmd_addr: &[u8], dummy_len: u32, out: &mut [u8], ptrs: *const FlashFunctionPointers) {
+        read_flash_inner(
+            FlashCommand {
+                cmd_addr: cmd_addr.as_ptr(),
+                cmd_addr_len: cmd_addr.len() as u32,
+                dummy_len,
+                data: out.as_mut_ptr(),
+                data_len: out.len() as u32,
+            },
+            ptrs,
+        );
+    }
+
+    /// Issue a generic SPI flash read command
+    ///
+    /// # Arguments
+    ///
+    /// * `cmd` - `FlashCommand` structure
+    /// * `ptrs` - Flash function pointers as per `write_flash_inner`
+    ///
+    /// Credit: taken from `rp2040-flash` (also licensed Apache+MIT)
+    #[inline(never)]
+    #[link_section = ".data.ram_func"]
+    unsafe fn read_flash_inner(cmd: FlashCommand, ptrs: *const FlashFunctionPointers) {
+        core::arch::asm!(
+            "mov r10, r0", // cmd
+            "mov r5, r1", // ptrs
+
+            "ldr r4, [r5, #0]",
+            "blx r4", // connect_internal_flash()
+
+            "ldr r4, [r5, #4]",
+            "blx r4", // flash_exit_xip()
+
+            "mov r7, r10", // cmd
+
+            "movs r4, #0x18",
+            "lsls r4, r4, #24", // 0x18000000, SSI, RP2040 datasheet 4.10.13
+
+            // Disable, write 0 to SSIENR
+            "movs r0, #0",
+            "str r0, [r4, #8]", // SSIENR
+
+            // Write ctrlr0
+            "movs r0, #0x3",
+            "lsls r0, r0, #8", // TMOD=0x300
+            "ldr r1, [r4, #0]", // CTRLR0
+            "orrs r1, r0",
+            "str r1, [r4, #0]",
+
+            // Write ctrlr1 with len-1
+            "ldr r0, [r7, #8]", // dummy_len
+            "ldr r1, [r7, #16]", // data_len
+            "add r0, r1",
+            "subs r0, #1",
+            "str r0, [r4, #0x04]", // CTRLR1
+
+            // Enable, write 1 to ssienr
+            "movs r0, #1",
+            "str r0, [r4, #8]", // SSIENR
+
+            // Write cmd/addr phase to DR
+            "mov r2, r4",
+            "adds r2, 0x60", // &DR
+            "ldr r0, [r7, #0]", // cmd_addr
+            "ldr r1, [r7, #4]", // cmd_addr_len
+            "10:",
+            "ldrb r3, [r0]",
+            "strb r3, [r2]", // DR
+            "adds r0, #1",
+            "subs r1, #1",
+            "bne 10b",
+
+            // Skip any dummy cycles
+            "ldr r1, [r7, #8]", // dummy_len
+            "cmp r1, #0",
+            "beq 9f",
+            "4:",
+            "ldr r3, [r4, #0x28]", // SR
+            "movs r2, #0x8",
+            "tst r3, r2", // SR.RFNE
+            "beq 4b",
+
+            "mov r2, r4",
+            "adds r2, 0x60", // &DR
+            "ldrb r3, [r2]", // DR
+            "subs r1, #1",
+            "bne 4b",
+
+            // Read RX fifo
+            "9:",
+            "ldr r0, [r7, #12]", // data
+            "ldr r1, [r7, #16]", // data_len
+
+            "2:",
+            "ldr r3, [r4, #0x28]", // SR
+            "movs r2, #0x8",
+            "tst r3, r2", // SR.RFNE
+            "beq 2b",
+
+            "mov r2, r4",
+            "adds r2, 0x60", // &DR
+            "ldrb r3, [r2]", // DR
+            "strb r3, [r0]",
+            "adds r0, #1",
+            "subs r1, #1",
+            "bne 2b",
+
+            // Disable, write 0 to ssienr
+            "movs r0, #0",
+            "str r0, [r4, #8]", // SSIENR
+
+            // Write 0 to CTRLR1 (returning to its default value)
+            //
+            // flash_enter_cmd_xip does NOT do this, and everything goes
+            // wrong unless we do it here
+            "str r0, [r4, #4]", // CTRLR1
+
+            "ldr r4, [r5, #20]",
+            "blx r4", // flash_enter_cmd_xip();
+
+            in("r0") &cmd as *const FlashCommand,
+            in("r1") ptrs,
+            out("r2") _,
+            out("r3") _,
+            out("r4") _,
+            // Registers r8-r10 are used to store values
+            // from r0-r2 in registers not clobbered by
+            // function calls.
+            // The values can't be passed in using r8-r10 directly
+            // due to https://github.com/rust-lang/rust/issues/99071
+            out("r8") _,
+            out("r9") _,
+            out("r10") _,
             clobber_abi("C"),
         );
     }
