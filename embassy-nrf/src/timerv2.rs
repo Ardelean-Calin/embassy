@@ -1,6 +1,6 @@
 use core::marker::PhantomData;
 
-use nrf52832_pac as pac;
+use nrf52840_pac as pac;
 
 use crate::ppi::Task;
 
